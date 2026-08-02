@@ -1,0 +1,30 @@
+file,verdict,claimed_type,offset,size,footer_matched,detected_type
+carved/00000.htm,VALID,htm,4691,18064,yes,HTML document; ASCII text; with very long lines (1173)
+carved/00001.doc,PARTIAL,doc,1050112,930304,no,Composite Document File V2 Document; Cannot read section info
+carved/00002.jpg,VALID,jpg,1980416,5883,yes,JPEG image data; JFIF standard 1.02; resolution (DPI); density 72x72; segment length 16; Exif Standard: [TIFF image data; big-endian; direntries=7; orientation=upper-left; xresolution=98; yresolution=106; resolutionunit=2; software=Adobe Photoshop CS Macintosh; datetime=2005:12:01 17:40:18]
+carved/00003.jpg,VALID,jpg,1995443,5551,yes,JPEG image data; JFIF standard 1.02; resolution (DPI); density 72x72; segment length 16; baseline; precision 8; 160x120; components 3
+carved/00004.htm,VALID,htm,2271312,33704,yes,HTML document; ASCII text; with CRLF; LF line terminators
+carved/00005.doc,PARTIAL,doc,4077568,9297,no,Composite Document File V2 Document; Can't read SAT
+carved/00006.png,VALID,png,4086865,6428,yes,PNG image data; 1408 x 1800; 1-bit grayscale; non-interlaced
+carved/00007.jpg,VALID,jpg,4241920,608703,yes,JPEG image data; JFIF standard 1.01; resolution (DPCM); density 37x37; segment length 16; baseline; precision 8; 2048x1536; components 3
+carved/00008.jpg,VALID,jpg,5948928,2219,yes,JPEG image data; JFIF standard 1.02; resolution (DPI); density 200x200; segment length 16
+carved/00009.jpg,VALID,jpg,6257664,7113968,yes,JPEG image data; JFIF standard 1.01; aspect ratio; density 1x1; segment length 16; baseline; precision 8; 11598x11598; components 3
+carved/00010.htm,MISMATCH,htm,14078061,358368,yes,data
+carved/00011.htm,MISMATCH,htm,14460928,51251,yes,data
+carved/00012.zip,VALID,zip,14560768,147132,yes,Zip archive data; at least v2.0 to extract; compression method=deflate
+carved/00013.zip,VALID,zip,14709248,1351631,yes,Zip archive data; at least v2.0 to extract; compression method=deflate
+carved/00014.jpg,VALID,jpg,16115200,210994,yes,JPEG image data; JFIF standard 1.01; aspect ratio; density 1x1; segment length 16; baseline; precision 8; 700x500; components 3
+carved/00015.doc,PARTIAL,doc,16812544,89671,no,Composite Document File V2 Document; Can't read SAT
+carved/00016.png,VALID,png,16902215,71020,yes,PNG image data; 1052 x 360; 8-bit/color RGB; non-interlaced
+carved/00017.doc,PARTIAL,doc,17555456,565240,no,Composite Document File V2 Document; Can't read SAT
+carved/00018.png,VALID,png,18120696,19893,yes,PNG image data; 879 x 499; 8-bit grayscale; non-interlaced
+carved/00019.png,VALID,png,18140936,74488,yes,PNG image data; 1140 x 540; 8-bit/color RGB; non-interlaced
+carved/00020.jpg,VALID,jpg,18581504,178659,yes,JPEG image data; JFIF standard 1.01; aspect ratio; density 1x1; segment length 16; comment: " xat.com Image Optimizer "; baseline; precision 8; 2407x2187; components 3
+carved/00021.doc,PARTIAL,doc,18942976,1863680,no,Composite Document File V2 Document; Can't read SAT
+carved/00022.jpg,VALID,jpg,20806656,299479,yes,JPEG image data; JFIF standard 1.01; resolution (DPCM); density 37x37; segment length 16; baseline; precision 8; 1933x1352; components 3
+carved/00023.jpg,VALID,jpg,21304832,1237789,yes,JPEG image data; JFIF standard 1.02; aspect ratio; density 100x100; segment length 16; baseline; precision 8; 1280x1024; components 3
+carved/00024.zip,VALID,zip,23047680,271699,yes,Zip archive data; at least v2.0 to extract; compression method=deflate
+carved/00025.jpg,VALID,jpg,23329792,6808,yes,JPEG image data; JFIF standard 1.02; resolution (DPI); density 300x300; segment length 16
+carved/00026.doc,VALID,doc,23533568,484352,no,Composite Document File V2 Document; Little Endian; Os: Windows; Version 5.1; Code page: 1252; Title: Statements of Financial Condition ; Author: Nancy Edwards; Template: Normal.dot; Last Saved By: User name placeholder; Revision Number: 3; Name of Creating Application: Microsoft Word 10.0; Total Editing Time: 02:00; Last Printed: Fri Jul  8 19:46:00 2005; Create Time/Date: Tue Apr 25 13:58:00 2006; Last Saved Time/Date: Tue Apr 25 13:59:00 2006; Number of Pages: 1; Number of Words: 215; Number of Characters: 1230; Security: 0
+carved/00027.jpg,VALID,jpg,24017920,20000000,no,JPEG image data; JFIF standard 1.01; resolution (DPI); density 120x120; segment length 16; Exif Standard: [TIFF image data; big-endian; direntries=0]; baseline; precision 8; 8640x8640; components 3
+carved/00028.jpg,VALID,jpg,48561152,3451,yes,JPEG image data; JFIF standard 1.02; resolution (DPI); density 300x300; segment length 16
