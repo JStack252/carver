@@ -1,0 +1,10 @@
+*.dd
+*.raw
+*.zip
+*.bz2
+carved/
+recovered/
+carver
+dfrws/
+dfrws2006-challenge/
+scalpel/
