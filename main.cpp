@@ -12,11 +12,19 @@
 //                                 used to validate carved output.
 //
 // Pipeline:
-//   Phase 1  metadata-based recovery of deleted files (needs a filesystem)
+//   Phase 1  metadata-based recovery of deleted files, recording the
+//            byte extents each one occupied
 //   Phase 2  map unallocated space, or fall back to the whole image
 //   Phase 3  signature carving over those ranges, with format-aware
-//            end-of-file detection for JPEG
-//   Phase 4  validate each carved candidate against its actual content
+//            end-of-file detection for JPEG and ZIP
+//   Phase 4  validate carved output against its actual content, and
+//            reconcile it against Phase 1 extents to recover the
+//            original filename and timestamps
+//
+// The reconciliation step is the reason both halves live in one tool:
+// a carver alone produces anonymous 00001.jpg files, and a metadata
+// walker alone cannot see files whose directory entries are gone.
+// Overlaying them recovers identity for data only carving could find.
 //
 // Build:  make
 // Run:    ./carver <image> [scalpel.conf]
@@ -27,10 +35,20 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <ctime>
 #include <sys/stat.h>
 #include <string>
 #include <vector>
 #include <algorithm>
+
+// ===============================================================
+// Byte ranges
+// ===============================================================
+
+struct ByteRange {
+    TSK_OFF_T start;
+    TSK_OFF_T length;
+};
 
 // ===============================================================
 // Signatures
@@ -62,7 +80,7 @@ static std::vector<unsigned char> parse_sig_string(const std::string &s) {
 static void load_default_signatures(std::vector<Signature> &sigs) {
     // NOTE: jpg max_size is 50MB. The DFRWS challenge deliberately
     // includes a 24.5MB JPEG (scenario 3i) to punish tools that assume
-    // a small default cap -- a 20MB limit truncates it.
+    // a small default cap.
     struct { const char *ext; bool cs; size_t max; const char *hdr; const char *ftr; } defs[] = {
         { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe0", "\\xff\\xd9" },
         { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe1", "\\xff\\xd9" },
@@ -124,16 +142,9 @@ static bool sig_match(const unsigned char *data, size_t avail,
 //
 // Searching for the first 0xFFD9 is unreliable because that byte pair
 // occurs constantly inside entropy-coded image data. Instead we walk
-// the JPEG segment structure the way a decoder would:
-//
-//   * every marker is 0xFF followed by a marker byte
-//   * most markers carry a 2-byte big-endian length
-//   * standalone markers (RST0-7, TEM) carry no length
-//   * after SOS the entropy data runs until the next real marker;
-//     0xFF00 is a stuffed byte and 0xFFD0-D7 are restart markers,
-//     neither of which ends the scan
-//
-// Returns the true file length, or 0 if the structure doesn't parse.
+// the JPEG segment structure the way a decoder would. A parse failure
+// on an otherwise valid JPEG header is strong evidence the file is
+// fragmented -- the walk runs into foreign data and loses sync.
 
 static size_t jpeg_true_length(const unsigned char *d, size_t n) {
     if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return 0;
@@ -147,7 +158,7 @@ static size_t jpeg_true_length(const unsigned char *d, size_t n) {
         unsigned char marker = d[i];
         i++;
 
-        if (marker == 0xD9) return i;                // EOI: true end of file
+        if (marker == 0xD9) return i;                // EOI: true end
         if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
 
         if (i + 1 >= n) return 0;
@@ -161,7 +172,7 @@ static size_t jpeg_true_length(const unsigned char *d, size_t n) {
                     unsigned char m2 = d[i+1];
                     if (m2 == 0x00) { i += 2; continue; }               // stuffed
                     if (m2 >= 0xD0 && m2 <= 0xD7) { i += 2; continue; } // restart
-                    break;                                              // real marker
+                    break;
                 }
                 i++;
             }
@@ -177,7 +188,7 @@ static bool is_jpeg_ext(const std::string &e) {
 }
 
 // ===============================================================
-// Phase 4: content validation via libmagic
+// Content validation via libmagic
 // ===============================================================
 
 static std::vector<std::string> expected_for(const std::string &ext) {
@@ -216,14 +227,15 @@ static bool looks_truncated(const std::string &desc) {
     return false;
 }
 
-enum Verdict { V_VALID, V_PARTIAL, V_MISMATCH, V_UNKNOWN };
+enum Verdict { V_VALID, V_PARTIAL, V_FRAGMENTED, V_MISMATCH, V_UNKNOWN };
 
 static const char *verdict_name(Verdict v) {
     switch (v) {
-        case V_VALID:    return "VALID";
-        case V_PARTIAL:  return "PARTIAL";
-        case V_MISMATCH: return "MISMATCH";
-        default:         return "UNKNOWN";
+        case V_VALID:      return "VALID";
+        case V_PARTIAL:    return "PARTIAL";
+        case V_FRAGMENTED: return "FRAGMENTED";
+        case V_MISMATCH:   return "MISMATCH";
+        default:           return "UNKNOWN";
     }
 }
 
@@ -240,41 +252,62 @@ static Verdict classify(const std::string &ext, const std::string &desc) {
 }
 
 // ===============================================================
-// Unallocated runs
+// Phase 1: deleted files and the extents they occupied
 // ===============================================================
 
-struct UnallocRun { TSK_OFF_T start_offset; TSK_OFF_T length; };
+struct DeletedFile {
+    std::string name;
+    TSK_OFF_T size;
+    time_t mtime;
+    time_t crtime;
+    std::vector<ByteRange> extents;   // where its data physically lived
 
-struct UnallocState {
-    std::vector<UnallocRun> runs;
-    TSK_DADDR_T prev_addr;
-    bool have_prev;
+    // scratch, needed by the extent callback
     TSK_OFF_T fs_offset;
     unsigned int block_size;
 };
 
+struct Phase1Ctx {
+    TSK_OFF_T fs_offset;
+    unsigned int block_size;
+    std::vector<DeletedFile> deleted;
+};
+
+// Records the physical blocks a file occupied. AONLY means TSK gives us
+// addresses without reading content, which is all we need here.
 static TSK_WALK_RET_ENUM
-block_walk_cb(const TSK_FS_BLOCK *block, void *ptr) {
-    UnallocState *st = (UnallocState *)ptr;
-    if (st->have_prev && block->addr == st->prev_addr + 1) {
-        st->runs.back().length += st->block_size;
+file_extent_cb(TSK_FS_FILE *fs_file, TSK_OFF_T off, TSK_DADDR_T addr,
+               char *buf, size_t len, TSK_FS_BLOCK_FLAG_ENUM flags, void *ptr) {
+    DeletedFile *df = (DeletedFile *)ptr;
+    if (addr == 0 || len == 0) return TSK_WALK_CONT;   // sparse / no block
+
+    TSK_OFF_T bstart = df->fs_offset + (TSK_OFF_T)addr * (TSK_OFF_T)df->block_size;
+
+    if (!df->extents.empty() &&
+        df->extents.back().start + df->extents.back().length == bstart) {
+        df->extents.back().length += (TSK_OFF_T)len;
     } else {
-        UnallocRun run;
-        run.start_offset = st->fs_offset + (TSK_OFF_T)block->addr * st->block_size;
-        run.length = st->block_size;
-        st->runs.push_back(run);
+        ByteRange r;
+        r.start = bstart;
+        r.length = (TSK_OFF_T)len;
+        df->extents.push_back(r);
     }
-    st->prev_addr = block->addr;
-    st->have_prev = true;
     return TSK_WALK_CONT;
 }
 
-// ===============================================================
-// Phase 1
-// ===============================================================
+static std::string fmt_time(time_t t) {
+    if (t == 0) return "-";
+    char b[64];
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
+    return std::string(b);
+}
 
 static TSK_WALK_RET_ENUM
 dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
+    Phase1Ctx *ctx = (Phase1Ctx *)ptr;
+
     if (fs_file->name == NULL) return TSK_WALK_CONT;
     if (strcmp(fs_file->name->name, ".") == 0 ||
         strcmp(fs_file->name->name, "..") == 0) return TSK_WALK_CONT;
@@ -287,23 +320,99 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
     else                       printf("  (metadata gone)");
     printf("\n");
 
-    if (deleted && fs_file->meta != NULL && fs_file->meta->size > 0) {
-        TSK_OFF_T size = fs_file->meta->size;
-        char *buf = new char[size];
-        ssize_t got = tsk_fs_file_read(fs_file, 0, buf, size, TSK_FS_FILE_READ_FLAG_NONE);
-        if (got > 0) {
-            mkdir("recovered", 0755);
-            char outpath[512];
-            snprintf(outpath, sizeof(outpath), "recovered/%s", fs_file->name->name);
-            FILE *out = fopen(outpath, "wb");
-            if (out) {
-                fwrite(buf, 1, got, out);
-                fclose(out);
-                printf("    -> recovered %zd bytes to %s\n", got, outpath);
-            }
-        }
-        delete[] buf;
+    if (!deleted || fs_file->meta == NULL || fs_file->meta->size <= 0) {
+        return TSK_WALK_CONT;
     }
+
+    // --- extract content ----------------------------------------
+    TSK_OFF_T size = fs_file->meta->size;
+    char *buf = new char[size];
+    ssize_t got = tsk_fs_file_read(fs_file, 0, buf, size, TSK_FS_FILE_READ_FLAG_NONE);
+    if (got > 0) {
+        mkdir("recovered", 0755);
+        char outpath[512];
+        snprintf(outpath, sizeof(outpath), "recovered/%s", fs_file->name->name);
+        FILE *out = fopen(outpath, "wb");
+        if (out) {
+            fwrite(buf, 1, got, out);
+            fclose(out);
+            printf("    -> recovered %zd bytes to %s\n", got, outpath);
+        }
+    }
+    delete[] buf;
+
+    // --- record where its data lived, for later reconciliation ---
+    DeletedFile df;
+    df.name = fs_file->name->name;
+    df.size = fs_file->meta->size;
+    df.mtime = (time_t)fs_file->meta->mtime;
+    df.crtime = (time_t)fs_file->meta->crtime;
+    df.fs_offset = ctx->fs_offset;
+    df.block_size = ctx->block_size;
+
+    tsk_fs_file_walk(fs_file, TSK_FS_FILE_WALK_FLAG_AONLY, file_extent_cb, &df);
+
+    if (!df.extents.empty()) {
+        printf("    extents:");
+        for (size_t i = 0; i < df.extents.size() && i < 4; i++) {
+            printf(" [%lld+%lld]", (long long)df.extents[i].start,
+                                   (long long)df.extents[i].length);
+        }
+        if (df.extents.size() > 4) printf(" ... (%zu total)", df.extents.size());
+        printf("\n");
+    }
+
+    ctx->deleted.push_back(df);
+    return TSK_WALK_CONT;
+}
+
+// Which deleted file, if any, owned the byte at this offset?
+static const DeletedFile *
+find_owner(const std::vector<DeletedFile> &dels, TSK_OFF_T off) {
+    for (size_t i = 0; i < dels.size(); i++) {
+        for (size_t e = 0; e < dels[i].extents.size(); e++) {
+            TSK_OFF_T s = dels[i].extents[e].start;
+            TSK_OFF_T len = dels[i].extents[e].length;
+            if (off >= s && off < s + len) return &dels[i];
+        }
+    }
+    return NULL;
+}
+
+static std::string sanitize(const std::string &s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        o += (isalnum(c) || c == '.' || c == '-' || c == '_') ? (char)c : '_';
+    }
+    return o;
+}
+
+// ===============================================================
+// Unallocated space mapping
+// ===============================================================
+
+struct UnallocState {
+    std::vector<ByteRange> runs;
+    TSK_DADDR_T prev_addr;
+    bool have_prev;
+    TSK_OFF_T fs_offset;
+    unsigned int block_size;
+};
+
+static TSK_WALK_RET_ENUM
+block_walk_cb(const TSK_FS_BLOCK *block, void *ptr) {
+    UnallocState *st = (UnallocState *)ptr;
+    if (st->have_prev && block->addr == st->prev_addr + 1) {
+        st->runs.back().length += st->block_size;
+    } else {
+        ByteRange run;
+        run.start = st->fs_offset + (TSK_OFF_T)block->addr * st->block_size;
+        run.length = st->block_size;
+        st->runs.push_back(run);
+    }
+    st->prev_addr = block->addr;
+    st->have_prev = true;
     return TSK_WALK_CONT;
 }
 
@@ -320,13 +429,16 @@ struct CarveResult {
     TSK_OFF_T size;
     std::string claimed;
     std::string detected;
-    std::string method;      // how the end of the file was decided
+    std::string method;
+    std::string origname;    // recovered via reconciliation, "" if none
+    std::string origtime;
     Verdict verdict;
 };
 
 static void carve_runs(TSK_IMG_INFO *img,
-                       const std::vector<UnallocRun> &runs,
-                       const std::vector<Signature> &sigs) {
+                       const std::vector<ByteRange> &runs,
+                       const std::vector<Signature> &sigs,
+                       const std::vector<DeletedFile> &deleted) {
     const size_t CHUNK = 1024 * 1024;
 
     size_t max_pat = 1;
@@ -341,7 +453,7 @@ static void carve_runs(TSK_IMG_INFO *img,
 
     // ---- Pass 1: locate headers and footers ---------------------
     for (size_t r = 0; r < runs.size(); r++) {
-        TSK_OFF_T run_start = runs[r].start_offset;
+        TSK_OFF_T run_start = runs[r].start;
         TSK_OFF_T run_end   = run_start + runs[r].length;
 
         for (TSK_OFF_T pos = run_start; pos < run_end; pos += CHUNK) {
@@ -384,10 +496,10 @@ static void carve_runs(TSK_IMG_INFO *img,
         if (magic) { magic_close(magic); magic = NULL; }
     }
 
-    // ---- Pass 2: extract and validate ---------------------------
+    // ---- Pass 2: extract, validate, reconcile -------------------
     mkdir("carved", 0755);
     std::vector<CarveResult> results;
-    int carved_count = 0, skipped = 0;
+    int carved_count = 0, skipped = 0, reconciled = 0;
     TSK_OFF_T skip_until = -1;
 
     for (size_t h = 0; h < headers.size(); h++) {
@@ -399,8 +511,9 @@ static void carve_runs(TSK_IMG_INFO *img,
         TSK_OFF_T end   = -1;
         std::string method;
         bool confident = false;
+        bool structure_failed = false;
 
-        // --- (a) format-aware end detection, where we have one ----
+        // --- (a) format-aware end detection -----------------------
         if (is_jpeg_ext(sig.ext)) {
             TSK_OFF_T window = (TSK_OFF_T)sig.max_size;
             if (start + window > img->size) window = img->size - start;
@@ -413,6 +526,8 @@ static void carve_runs(TSK_IMG_INFO *img,
                         end = start + (TSK_OFF_T)truelen;
                         method = "structure";
                         confident = true;
+                    } else {
+                        structure_failed = true;
                     }
                 }
             }
@@ -425,14 +540,28 @@ static void carve_runs(TSK_IMG_INFO *img,
                 if (footers[f].offset <= start) continue;
                 if (footers[f].offset > limit) break;
                 if (footers[f].sig_index != hit.sig_index) continue;
-                end = footers[f].offset + (TSK_OFF_T)sig.footer.size();
+
+                TSK_OFF_T fo = footers[f].offset;
+                if (sig.ext == "zip") {
+                    // End-of-central-directory: 22 fixed bytes plus a
+                    // comment whose length is in the last 2 bytes.
+                    unsigned char eocd[22];
+                    if (tsk_img_read(img, fo, (char *)eocd, 22) == 22) {
+                        size_t comment = (size_t)eocd[20] | ((size_t)eocd[21] << 8);
+                        end = fo + 22 + (TSK_OFF_T)comment;
+                    } else {
+                        end = fo + (TSK_OFF_T)sig.footer.size();
+                    }
+                } else {
+                    end = fo + (TSK_OFF_T)sig.footer.size();
+                }
                 method = "footer";
                 confident = true;
                 break;
             }
         }
 
-        // --- (c) bound by the next header -------------------------
+        // --- (c) bound by next header -----------------------------
         if (end == -1) {
             TSK_OFF_T bound = start + (TSK_OFF_T)sig.max_size;
             for (size_t n = h + 1; n < headers.size(); n++) {
@@ -450,16 +579,23 @@ static void carve_runs(TSK_IMG_INFO *img,
         TSK_OFF_T len = end - start;
         if (len <= 0) continue;
 
+        // --- reconciliation: did a deleted file own these bytes? ---
+        const DeletedFile *owner = find_owner(deleted, start);
+
         char outpath[512];
-        snprintf(outpath, sizeof(outpath), "carved/%05d.%s",
-                 carved_count, sig.ext.c_str());
+        if (owner != NULL) {
+            snprintf(outpath, sizeof(outpath), "carved/%05d_%s",
+                     carved_count, sanitize(owner->name).c_str());
+        } else {
+            snprintf(outpath, sizeof(outpath), "carved/%05d.%s",
+                     carved_count, sig.ext.c_str());
+        }
 
         FILE *out = fopen(outpath, "wb");
         if (out == NULL) continue;
 
         const size_t SNIFF = 1024 * 1024;
         std::vector<char> sniff;
-
         std::vector<char> data(65536);
         TSK_OFF_T remaining = len, at = start;
         while (remaining > 0) {
@@ -486,6 +622,8 @@ static void carve_runs(TSK_IMG_INFO *img,
         res.method = method;
         res.verdict = V_UNKNOWN;
         res.detected = "(not checked)";
+        res.origname = (owner != NULL) ? owner->name : "";
+        res.origtime = (owner != NULL) ? fmt_time(owner->mtime) : "";
 
         if (magic != NULL && !sniff.empty()) {
             const char *desc = magic_buffer(magic, &sniff[0], sniff.size());
@@ -493,12 +631,24 @@ static void carve_runs(TSK_IMG_INFO *img,
             res.verdict = classify(sig.ext, res.detected);
         }
 
-        std::string shortdesc = res.detected;
-        if (shortdesc.size() > 46) shortdesc = shortdesc.substr(0, 43) + "...";
+        // libmagic only reads the head of a file, so it calls a
+        // fragmented JPEG valid. The structural walk knows better.
+        if (structure_failed && res.verdict == V_VALID) {
+            res.verdict = V_FRAGMENTED;
+        }
 
-        printf("  %-20s %-9s %-12s off=%-9lld size=%-9lld %s\n",
+        std::string shortdesc = res.detected;
+        if (shortdesc.size() > 40) shortdesc = shortdesc.substr(0, 37) + "...";
+
+        printf("  %-24s %-11s %-12s off=%-9lld size=%-9lld %s\n",
                outpath, verdict_name(res.verdict), method.c_str(),
                (long long)start, (long long)len, shortdesc.c_str());
+
+        if (owner != NULL) {
+            printf("      reconciled -> original name \"%s\", modified %s\n",
+                   owner->name.c_str(), res.origtime.c_str());
+            reconciled++;
+        }
 
         results.push_back(res);
         carved_count++;
@@ -507,13 +657,14 @@ static void carve_runs(TSK_IMG_INFO *img,
 
     if (magic) magic_close(magic);
 
-    int nv = 0, np = 0, nm = 0, nu = 0;
+    int nv = 0, np = 0, nf = 0, nm = 0, nu = 0;
     for (size_t i = 0; i < results.size(); i++) {
         switch (results[i].verdict) {
-            case V_VALID:    nv++; break;
-            case V_PARTIAL:  np++; break;
-            case V_MISMATCH: nm++; break;
-            default:         nu++; break;
+            case V_VALID:      nv++; break;
+            case V_PARTIAL:    np++; break;
+            case V_FRAGMENTED: nf++; break;
+            case V_MISMATCH:   nm++; break;
+            default:           nu++; break;
         }
     }
 
@@ -521,32 +672,34 @@ static void carve_runs(TSK_IMG_INFO *img,
     printf("  Candidates carved : %d  (%d header(s) suppressed as overlapping)\n",
            carved_count, skipped);
     printf("  VALID             : %d   content matches claimed type\n", nv);
+    printf("  FRAGMENTED        : %d   valid header, structure does not parse\n", nf);
     printf("  PARTIAL           : %d   right type, structure incomplete\n", np);
     printf("  MISMATCH          : %d   likely false positive\n", nm);
     printf("  UNKNOWN           : %d   no validation rule for this type\n", nu);
+    printf("  RECONCILED        : %d   carved data matched to a deleted filename\n",
+           reconciled);
 
     FILE *rep = fopen("carved/report.txt", "w");
     if (rep) {
-        fprintf(rep, "file,verdict,claimed_type,offset,size,end_detection,detected_type\n");
+        fprintf(rep, "file,verdict,claimed_type,offset,size,end_detection,"
+                     "original_name,original_mtime,detected_type\n");
         for (size_t i = 0; i < results.size(); i++) {
             std::string d = results[i].detected;
             for (size_t j = 0; j < d.size(); j++) if (d[j] == ',') d[j] = ';';
-            fprintf(rep, "%s,%s,%s,%lld,%lld,%s,%s\n",
+            fprintf(rep, "%s,%s,%s,%lld,%lld,%s,%s,%s,%s\n",
                     results[i].path.c_str(),
                     verdict_name(results[i].verdict),
                     results[i].claimed.c_str(),
                     (long long)results[i].offset,
                     (long long)results[i].size,
                     results[i].method.c_str(),
+                    results[i].origname.empty() ? "-" : results[i].origname.c_str(),
+                    results[i].origtime.empty() ? "-" : results[i].origtime.c_str(),
                     d.c_str());
         }
         fclose(rep);
         printf("\nReport written to carved/report.txt\n");
     }
-
-    // TODO (reconciliation): cross-reference carved offsets with the
-    // cluster ranges of deleted files from Phase 1, so carved data can
-    // recover its original filename and timestamps.
 }
 
 // ===============================================================
@@ -576,7 +729,8 @@ int main(int argc, char **argv) {
         printf("Using %zu built-in signature(s)\n\n", sigs.size());
     }
 
-    std::vector<UnallocRun> runs;
+    std::vector<ByteRange> runs;
+    std::vector<DeletedFile> deleted;
     TSK_FS_INFO *fs = NULL;
     TSK_VS_INFO *vs = NULL;
     TSK_OFF_T fs_offset = -1;
@@ -604,10 +758,17 @@ int main(int argc, char **argv) {
                tsk_fs_type_toname(fs->ftype), (long long)fs_offset, fs->block_size);
 
         printf("=== Phase 1: metadata-based recovery ===\n\n");
+        Phase1Ctx ctx;
+        ctx.fs_offset = fs_offset;
+        ctx.block_size = fs->block_size;
+
         TSK_FS_DIR_WALK_FLAG_ENUM wf = (TSK_FS_DIR_WALK_FLAG_ENUM)
             (TSK_FS_DIR_WALK_FLAG_ALLOC | TSK_FS_DIR_WALK_FLAG_UNALLOC |
              TSK_FS_DIR_WALK_FLAG_RECURSE);
-        tsk_fs_dir_walk(fs, fs->root_inum, wf, dir_walk_cb, NULL);
+        tsk_fs_dir_walk(fs, fs->root_inum, wf, dir_walk_cb, &ctx);
+        deleted = ctx.deleted;
+
+        printf("\n  %zu deleted file(s) with recoverable extents\n", deleted.size());
 
         printf("\n=== Phase 2: mapping unallocated space ===\n\n");
         UnallocState st;
@@ -624,8 +785,8 @@ int main(int argc, char **argv) {
     } else {
         printf("=== Phase 1: skipped (no filesystem) ===\n\n");
         printf("=== Phase 2: treating entire image as unallocated ===\n\n");
-        UnallocRun whole;
-        whole.start_offset = 0;
+        ByteRange whole;
+        whole.start = 0;
         whole.length = img->size;
         runs.push_back(whole);
     }
@@ -635,8 +796,8 @@ int main(int argc, char **argv) {
     printf("%zu run(s) to scan, %lld bytes (%.1f MB)\n\n",
            runs.size(), (long long)total, total / (1024.0 * 1024.0));
 
-    printf("=== Phase 3/4: carving and validation ===\n\n");
-    carve_runs(img, runs, sigs);
+    printf("=== Phase 3/4: carving, validation, reconciliation ===\n\n");
+    carve_runs(img, runs, sigs, deleted);
 
     if (fs) tsk_fs_close(fs);
     if (vs) tsk_vs_close(vs);
