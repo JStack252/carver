@@ -9,12 +9,13 @@
 //                                 two-pass header/footer carving
 //                                 approach, ported into carve_runs().
 //   * libmagic (file)          -- content-based type identification,
-//                                 used here to validate carved output.
+//                                 used to validate carved output.
 //
 // Pipeline:
 //   Phase 1  metadata-based recovery of deleted files (needs a filesystem)
 //   Phase 2  map unallocated space, or fall back to the whole image
-//   Phase 3  signature carving over those ranges
+//   Phase 3  signature carving over those ranges, with format-aware
+//            end-of-file detection for JPEG
 //   Phase 4  validate each carved candidate against its actual content
 //
 // Build:  make
@@ -59,9 +60,12 @@ static std::vector<unsigned char> parse_sig_string(const std::string &s) {
 }
 
 static void load_default_signatures(std::vector<Signature> &sigs) {
+    // NOTE: jpg max_size is 50MB. The DFRWS challenge deliberately
+    // includes a 24.5MB JPEG (scenario 3i) to punish tools that assume
+    // a small default cap -- a 20MB limit truncates it.
     struct { const char *ext; bool cs; size_t max; const char *hdr; const char *ftr; } defs[] = {
-        { "jpg", true, 20000000, "\\xff\\xd8\\xff\\xe0", "\\xff\\xd9" },
-        { "jpg", true, 20000000, "\\xff\\xd8\\xff\\xe1", "\\xff\\xd9" },
+        { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe0", "\\xff\\xd9" },
+        { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe1", "\\xff\\xd9" },
         { "gif", true,  5000000, "GIF87a",                "\\x00\\x3b" },
         { "gif", true,  5000000, "GIF89a",                "\\x00\\x3b" },
         { "png", true, 20000000, "\\x89PNG\\x0d\\x0a",    "IEND\\xae\\x42\\x60\\x82" },
@@ -115,16 +119,70 @@ static bool sig_match(const unsigned char *data, size_t avail,
 }
 
 // ===============================================================
+// Format-aware end detection: JPEG
+// ===============================================================
+//
+// Searching for the first 0xFFD9 is unreliable because that byte pair
+// occurs constantly inside entropy-coded image data. Instead we walk
+// the JPEG segment structure the way a decoder would:
+//
+//   * every marker is 0xFF followed by a marker byte
+//   * most markers carry a 2-byte big-endian length
+//   * standalone markers (RST0-7, TEM) carry no length
+//   * after SOS the entropy data runs until the next real marker;
+//     0xFF00 is a stuffed byte and 0xFFD0-D7 are restart markers,
+//     neither of which ends the scan
+//
+// Returns the true file length, or 0 if the structure doesn't parse.
+
+static size_t jpeg_true_length(const unsigned char *d, size_t n) {
+    if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return 0;
+
+    size_t i = 2;
+    while (i + 1 < n) {
+        if (d[i] != 0xFF) return 0;                  // lost sync
+        while (i < n && d[i] == 0xFF) i++;           // skip fill bytes
+        if (i >= n) return 0;
+
+        unsigned char marker = d[i];
+        i++;
+
+        if (marker == 0xD9) return i;                // EOI: true end of file
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+
+        if (i + 1 >= n) return 0;
+        size_t seglen = ((size_t)d[i] << 8) | (size_t)d[i+1];
+        if (seglen < 2 || i + seglen > n) return 0;
+
+        if (marker == 0xDA) {                        // start of scan
+            i += seglen;
+            while (i + 1 < n) {
+                if (d[i] == 0xFF) {
+                    unsigned char m2 = d[i+1];
+                    if (m2 == 0x00) { i += 2; continue; }               // stuffed
+                    if (m2 >= 0xD0 && m2 <= 0xD7) { i += 2; continue; } // restart
+                    break;                                              // real marker
+                }
+                i++;
+            }
+            continue;
+        }
+        i += seglen;
+    }
+    return 0;
+}
+
+static bool is_jpeg_ext(const std::string &e) {
+    return e == "jpg" || e == "jpeg" || e == "jfif";
+}
+
+// ===============================================================
 // Phase 4: content validation via libmagic
 // ===============================================================
 
-// What libmagic should say for a correctly carved file of each type.
-// If the detected description contains none of these, the carve is
-// almost certainly a false positive -- the header bytes matched by
-// chance inside unrelated data.
 static std::vector<std::string> expected_for(const std::string &ext) {
     std::vector<std::string> v;
-    if (ext == "jpg" || ext == "jpeg") { v.push_back("JPEG"); }
+    if (is_jpeg_ext(ext))              { v.push_back("JPEG"); }
     else if (ext == "png")             { v.push_back("PNG"); }
     else if (ext == "gif")             { v.push_back("GIF"); }
     else if (ext == "pdf")             { v.push_back("PDF"); }
@@ -147,8 +205,6 @@ static bool contains_ci(const std::string &hay, const std::string &needle) {
     return h.find(n) != std::string::npos;
 }
 
-// libmagic emits these when it recognises the container but the
-// internal structure is incomplete -- a truncated or fragmented carve.
 static bool looks_truncated(const std::string &desc) {
     static const char *warn[] = {
         "can't read", "cannot read", "truncated", "corrupt",
@@ -173,13 +229,12 @@ static const char *verdict_name(Verdict v) {
 
 static Verdict classify(const std::string &ext, const std::string &desc) {
     std::vector<std::string> want = expected_for(ext);
-    if (want.empty()) return V_UNKNOWN;      // no rule for this type
-
+    if (want.empty()) return V_UNKNOWN;
     bool type_ok = false;
     for (size_t i = 0; i < want.size(); i++) {
         if (contains_ci(desc, want[i])) { type_ok = true; break; }
     }
-    if (!type_ok) return V_MISMATCH;         // content is not what we claimed
+    if (!type_ok) return V_MISMATCH;
     if (looks_truncated(desc)) return V_PARTIAL;
     return V_VALID;
 }
@@ -257,7 +312,6 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
 // ===============================================================
 
 struct Hit { TSK_OFF_T offset; size_t sig_index; };
-
 static bool hit_less(const Hit &a, const Hit &b) { return a.offset < b.offset; }
 
 struct CarveResult {
@@ -266,8 +320,8 @@ struct CarveResult {
     TSK_OFF_T size;
     std::string claimed;
     std::string detected;
+    std::string method;      // how the end of the file was decided
     Verdict verdict;
-    bool had_footer;
 };
 
 static void carve_runs(TSK_IMG_INFO *img,
@@ -324,7 +378,6 @@ static void carve_runs(TSK_IMG_INFO *img,
     printf("Pass 1: %zu header hit(s), %zu footer hit(s)\n\n",
            headers.size(), footers.size());
 
-    // ---- libmagic handle ----------------------------------------
     magic_t magic = magic_open(MAGIC_NONE);
     if (magic == NULL || magic_load(magic, NULL) != 0) {
         fprintf(stderr, "Warning: libmagic unavailable, skipping validation\n");
@@ -344,21 +397,43 @@ static void carve_runs(TSK_IMG_INFO *img,
         const Signature &sig = sigs[hit.sig_index];
         TSK_OFF_T start = hit.offset;
         TSK_OFF_T end   = -1;
+        std::string method;
+        bool confident = false;
 
-        if (!sig.footer.empty()) {
+        // --- (a) format-aware end detection, where we have one ----
+        if (is_jpeg_ext(sig.ext)) {
+            TSK_OFF_T window = (TSK_OFF_T)sig.max_size;
+            if (start + window > img->size) window = img->size - start;
+            if (window > 0) {
+                std::vector<unsigned char> jb((size_t)window);
+                ssize_t got = tsk_img_read(img, start, (char *)&jb[0], (size_t)window);
+                if (got > 0) {
+                    size_t truelen = jpeg_true_length(&jb[0], (size_t)got);
+                    if (truelen > 0) {
+                        end = start + (TSK_OFF_T)truelen;
+                        method = "structure";
+                        confident = true;
+                    }
+                }
+            }
+        }
+
+        // --- (b) footer search ------------------------------------
+        if (end == -1 && !sig.footer.empty()) {
             TSK_OFF_T limit = start + (TSK_OFF_T)sig.max_size;
             for (size_t f = 0; f < footers.size(); f++) {
                 if (footers[f].offset <= start) continue;
                 if (footers[f].offset > limit) break;
                 if (footers[f].sig_index != hit.sig_index) continue;
                 end = footers[f].offset + (TSK_OFF_T)sig.footer.size();
+                method = "footer";
+                confident = true;
                 break;
             }
         }
 
-        bool had_footer = (end != -1);
-
-        if (!had_footer) {
+        // --- (c) bound by the next header -------------------------
+        if (end == -1) {
             TSK_OFF_T bound = start + (TSK_OFF_T)sig.max_size;
             for (size_t n = h + 1; n < headers.size(); n++) {
                 if (headers[n].offset > start) {
@@ -368,6 +443,8 @@ static void carve_runs(TSK_IMG_INFO *img,
             }
             if (bound > img->size) bound = img->size;
             end = bound;
+            method = "next-header";
+            confident = false;
         }
 
         TSK_OFF_T len = end - start;
@@ -380,11 +457,8 @@ static void carve_runs(TSK_IMG_INFO *img,
         FILE *out = fopen(outpath, "wb");
         if (out == NULL) continue;
 
-        // Keep the leading bytes for libmagic; it only needs the head
-        // of the file to identify (and structurally sanity-check) it.
         const size_t SNIFF = 1024 * 1024;
         std::vector<char> sniff;
-        sniff.reserve(len < (TSK_OFF_T)SNIFF ? (size_t)len : SNIFF);
 
         std::vector<char> data(65536);
         TSK_OFF_T remaining = len, at = start;
@@ -404,13 +478,12 @@ static void carve_runs(TSK_IMG_INFO *img,
         }
         fclose(out);
 
-        // ---- Phase 4: what does the content actually say it is? ----
         CarveResult res;
         res.path = outpath;
         res.offset = start;
         res.size = len;
         res.claimed = sig.ext;
-        res.had_footer = had_footer;
+        res.method = method;
         res.verdict = V_UNKNOWN;
         res.detected = "(not checked)";
 
@@ -420,22 +493,20 @@ static void carve_runs(TSK_IMG_INFO *img,
             res.verdict = classify(sig.ext, res.detected);
         }
 
-        // Trim the description for terminal output
         std::string shortdesc = res.detected;
-        if (shortdesc.size() > 58) shortdesc = shortdesc.substr(0, 55) + "...";
+        if (shortdesc.size() > 46) shortdesc = shortdesc.substr(0, 43) + "...";
 
-        printf("  %-20s %-9s off=%-10lld size=%-9lld %s\n",
-               outpath, verdict_name(res.verdict),
+        printf("  %-20s %-9s %-12s off=%-9lld size=%-9lld %s\n",
+               outpath, verdict_name(res.verdict), method.c_str(),
                (long long)start, (long long)len, shortdesc.c_str());
 
         results.push_back(res);
         carved_count++;
-        if (had_footer) skip_until = end;
+        if (confident) skip_until = end;
     }
 
     if (magic) magic_close(magic);
 
-    // ---- Summary -------------------------------------------------
     int nv = 0, np = 0, nm = 0, nu = 0;
     for (size_t i = 0; i < results.size(); i++) {
         switch (results[i].verdict) {
@@ -454,10 +525,9 @@ static void carve_runs(TSK_IMG_INFO *img,
     printf("  MISMATCH          : %d   likely false positive\n", nm);
     printf("  UNKNOWN           : %d   no validation rule for this type\n", nu);
 
-    // ---- Report file ---------------------------------------------
     FILE *rep = fopen("carved/report.txt", "w");
     if (rep) {
-        fprintf(rep, "file,verdict,claimed_type,offset,size,footer_matched,detected_type\n");
+        fprintf(rep, "file,verdict,claimed_type,offset,size,end_detection,detected_type\n");
         for (size_t i = 0; i < results.size(); i++) {
             std::string d = results[i].detected;
             for (size_t j = 0; j < d.size(); j++) if (d[j] == ',') d[j] = ';';
@@ -467,7 +537,7 @@ static void carve_runs(TSK_IMG_INFO *img,
                     results[i].claimed.c_str(),
                     (long long)results[i].offset,
                     (long long)results[i].size,
-                    results[i].had_footer ? "yes" : "no",
+                    results[i].method.c_str(),
                     d.c_str());
         }
         fclose(rep);
