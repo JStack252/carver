@@ -1,6 +1,6 @@
 // main.cpp
 //
-// Disk image recovery tool combining three open source projects:
+// Disk image recovery and triage tool combining three open source projects:
 //
 //   * The Sleuth Kit (libtsk)  -- filesystem parsing, deleted file
 //                                 metadata recovery, unallocated space
@@ -8,8 +8,7 @@
 //   * Scalpel                  -- signature database format and the
 //                                 two-pass header/footer carving
 //                                 approach, ported into carve_runs().
-//   * libmagic (file)          -- content-based type identification,
-//                                 used to validate carved output.
+//   * libmagic (file)          -- content-based type identification.
 //
 // Pipeline:
 //   Phase 1  metadata-based recovery of deleted files, recording the
@@ -17,14 +16,17 @@
 //   Phase 2  map unallocated space, or fall back to the whole image
 //   Phase 3  signature carving over those ranges, with format-aware
 //            end-of-file detection for JPEG and ZIP
-//   Phase 4  validate carved output against its actual content, and
-//            reconcile it against Phase 1 extents to recover the
-//            original filename and timestamps
+//   Phase 4  validate carved output, and reconcile it against Phase 1
+//            extents to recover original filenames and timestamps
+//   Phase 5  content triage: scan every file -- live, recovered and
+//            carved -- for polyglot structure, embedded formats,
+//            appended data and script/executable indicators
 //
-// The reconciliation step is the reason both halves live in one tool:
-// a carver alone produces anonymous 00001.jpg files, and a metadata
-// walker alone cannot see files whose directory entries are gone.
-// Overlaying them recovers identity for data only carving could find.
+// Phase 5 exists because recovering a deleted file is only half the
+// job during an incident: attackers delete their tooling, so the
+// recovered set is exactly where malicious content is most likely to
+// be. Recovering and triaging in one pass is the workflow that
+// currently requires stitching separate tools together.
 //
 // Build:  make
 // Run:    ./carver <image> [scalpel.conf]
@@ -42,17 +44,13 @@
 #include <algorithm>
 
 // ===============================================================
-// Byte ranges
+// Basic types
 // ===============================================================
 
 struct ByteRange {
     TSK_OFF_T start;
     TSK_OFF_T length;
 };
-
-// ===============================================================
-// Signatures
-// ===============================================================
 
 struct Signature {
     std::string ext;
@@ -61,6 +59,13 @@ struct Signature {
     std::vector<unsigned char> header;
     std::vector<unsigned char> footer;   // empty == no footer
 };
+
+// Largest file we will hold in memory for content scanning.
+static const size_t SCAN_CAP = 64u * 1024u * 1024u;
+
+// ===============================================================
+// Signature parsing / loading
+// ===============================================================
 
 static std::vector<unsigned char> parse_sig_string(const std::string &s) {
     std::vector<unsigned char> out;
@@ -78,9 +83,8 @@ static std::vector<unsigned char> parse_sig_string(const std::string &s) {
 }
 
 static void load_default_signatures(std::vector<Signature> &sigs) {
-    // NOTE: jpg max_size is 50MB. The DFRWS challenge deliberately
-    // includes a 24.5MB JPEG (scenario 3i) to punish tools that assume
-    // a small default cap.
+    // jpg max_size is 50MB: the DFRWS challenge includes a 24.5MB JPEG
+    // (scenario 3i) specifically to punish small default caps.
     struct { const char *ext; bool cs; size_t max; const char *hdr; const char *ftr; } defs[] = {
         { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe0", "\\xff\\xd9" },
         { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe1", "\\xff\\xd9" },
@@ -139,12 +143,6 @@ static bool sig_match(const unsigned char *data, size_t avail,
 // ===============================================================
 // Format-aware end detection: JPEG
 // ===============================================================
-//
-// Searching for the first 0xFFD9 is unreliable because that byte pair
-// occurs constantly inside entropy-coded image data. Instead we walk
-// the JPEG segment structure the way a decoder would. A parse failure
-// on an otherwise valid JPEG header is strong evidence the file is
-// fragmented -- the walk runs into foreign data and loses sync.
 
 static size_t jpeg_true_length(const unsigned char *d, size_t n) {
     if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return 0;
@@ -188,7 +186,7 @@ static bool is_jpeg_ext(const std::string &e) {
 }
 
 // ===============================================================
-// Content validation via libmagic
+// libmagic validation
 // ===============================================================
 
 static std::vector<std::string> expected_for(const std::string &ext) {
@@ -252,7 +250,182 @@ static Verdict classify(const std::string &ext, const std::string &desc) {
 }
 
 // ===============================================================
-// Phase 1: deleted files and the extents they occupied
+// PHASE 5: content triage
+// ===============================================================
+//
+// Three classes of finding:
+//
+//   1. Embedded format signatures. A second format's magic bytes
+//      appearing inside a file. Normal inside containers (ZIP, OLE,
+//      PDF) -- images legitimately live inside Word documents -- but
+//      highly suspicious inside a flat image format.
+//
+//   2. Appended data. For JPEG we know the true structural end, so
+//      anything past it was deliberately attached. This is the classic
+//      polyglot / stego carrier construction.
+//
+//   3. Script and executable indicators. Severity depends on the host:
+//      <script> in an HTML file is unremarkable; the same bytes inside
+//      a JPEG are not.
+
+struct Finding {
+    std::string severity;    // INFO / SUSPICIOUS / HIGH
+    std::string label;
+    long long offset;
+};
+
+struct FileReport {
+    std::string source;      // live / recovered / carved
+    std::string name;
+    std::string detected;
+    long long size;
+    std::vector<Finding> findings;
+};
+
+static bool type_is_container(const std::string &det) {
+    return contains_ci(det, "Zip") || contains_ci(det, "Composite Document") ||
+           contains_ci(det, "PDF") || contains_ci(det, "Microsoft") ||
+           contains_ci(det, "tar") || contains_ci(det, "gzip");
+}
+
+static bool type_is_flat_image(const std::string &det) {
+    return contains_ci(det, "JPEG") || contains_ci(det, "PNG") ||
+           contains_ci(det, "GIF")  || contains_ci(det, "bitmap");
+}
+
+static bool type_is_text(const std::string &det) {
+    return contains_ci(det, "text") || contains_ci(det, "HTML") ||
+           contains_ci(det, "XML")  || contains_ci(det, "script");
+}
+
+struct Indicator {
+    const char *label;
+    const char *pat;
+    size_t len;
+    bool binary_ok;   // meaningful even in binary files
+};
+
+static const Indicator INDICATORS[] = {
+    { "Windows PE executable stub", "This program cannot be run in DOS mode", 38, true },
+    { "ELF executable header",      "\x7f" "ELF", 4, true },
+    { "Script shebang",             "#!/", 3, false },
+    { "PDF JavaScript",             "/JavaScript", 11, true },
+    { "PDF OpenAction",             "/OpenAction", 11, true },
+    { "PDF Launch action",          "/Launch", 7, true },
+    { "PDF embedded file",          "/EmbeddedFile", 13, true },
+    { "Office VBA project",         "_VBA_PROJECT", 12, true },
+    { "OOXML macro stream",         "vbaProject.bin", 14, true },
+    { "HTML script tag",            "<script", 7, false },
+    { "PHP code block",             "<?php", 5, false },
+    { "Base64 decode call",         "FromBase64String", 16, false },
+    { "PowerShell encoded command", "-EncodedCommand", 15, false },
+    { "WScript shell object",       "WScript.Shell", 13, false },
+    { "eval() call",                "eval(", 5, false },
+};
+
+static bool mem_find(const unsigned char *d, size_t n,
+                     const char *pat, size_t plen, size_t *where) {
+    if (plen == 0 || n < plen) return false;
+    for (size_t i = 0; i + plen <= n; i++) {
+        if (memcmp(d + i, pat, plen) == 0) { *where = i; return true; }
+    }
+    return false;
+}
+
+static std::vector<Finding>
+scan_content(const unsigned char *d, size_t n,
+             const std::string &detected,
+             const std::vector<Signature> &sigs) {
+    std::vector<Finding> out;
+    if (n == 0) return out;
+
+    bool container = type_is_container(detected);
+    bool flat_img  = type_is_flat_image(detected);
+    bool textual   = type_is_text(detected);
+
+    // --- (1) embedded format signatures -------------------------
+    // Skip offset 0: that is the file's own type. Report at most one
+    // hit per format so a big archive does not produce noise.
+    std::vector<std::string> seen;
+    for (size_t i = 1; i < n; i++) {
+        for (size_t s = 0; s < sigs.size(); s++) {
+            if (!sig_match(d + i, n - i, sigs[s].header, sigs[s].case_sensitive)) continue;
+
+            if (std::find(seen.begin(), seen.end(), sigs[s].ext) != seen.end()) continue;
+            seen.push_back(sigs[s].ext);
+
+            // Same format nested in itself is routine: JPEGs carry Exif
+            // thumbnails, archives contain archives. Only a *foreign*
+            // format inside a flat file suggests a polyglot carrier.
+            bool same_as_host = false;
+            std::vector<std::string> want = expected_for(sigs[s].ext);
+            for (size_t w = 0; w < want.size(); w++) {
+                if (contains_ci(detected, want[w])) { same_as_host = true; break; }
+            }
+
+            Finding f;
+            f.offset = (long long)i;
+            f.label = "embedded " + sigs[s].ext + " signature";
+            if (same_as_host)   f.severity = "INFO";        // thumbnail / nesting
+            else if (container) f.severity = "INFO";        // normal nesting
+            else if (flat_img)  f.severity = "HIGH";        // polyglot carrier
+            else                f.severity = "SUSPICIOUS";
+            out.push_back(f);
+        }
+    }
+
+    // --- (2) data appended past the structural end --------------
+    if (contains_ci(detected, "JPEG")) {
+        size_t truelen = jpeg_true_length(d, n);
+        if (truelen > 0 && truelen < n) {
+            size_t extra = n - truelen;
+            if (extra > 16) {          // ignore trivial padding
+                Finding f;
+                f.severity = "HIGH";
+                f.offset = (long long)truelen;
+                char b[160];
+                snprintf(b, sizeof(b),
+                         "%zu bytes appended after JPEG end-of-image", extra);
+                f.label = b;
+                out.push_back(f);
+            }
+        }
+    }
+
+    // --- (3) script / executable indicators ---------------------
+    for (size_t k = 0; k < sizeof(INDICATORS)/sizeof(INDICATORS[0]); k++) {
+        size_t at = 0;
+        if (!mem_find(d, n, INDICATORS[k].pat, INDICATORS[k].len, &at)) continue;
+
+        Finding f;
+        f.offset = (long long)at;
+        f.label = INDICATORS[k].label;
+
+        if (flat_img) {
+            // Executable or script content inside a flat image is the
+            // signature of a weaponised file.
+            f.severity = "HIGH";
+        } else if (textual && !INDICATORS[k].binary_ok) {
+            f.severity = "INFO";       // scripts in HTML are expected
+        } else if (container) {
+            f.severity = "SUSPICIOUS";
+        } else {
+            f.severity = "SUSPICIOUS";
+        }
+        out.push_back(f);
+    }
+
+    return out;
+}
+
+static int severity_rank(const std::string &s) {
+    if (s == "HIGH") return 3;
+    if (s == "SUSPICIOUS") return 2;
+    return 1;
+}
+
+// ===============================================================
+// Phase 1: deleted files and their extents
 // ===============================================================
 
 struct DeletedFile {
@@ -260,10 +433,8 @@ struct DeletedFile {
     TSK_OFF_T size;
     time_t mtime;
     time_t crtime;
-    std::vector<ByteRange> extents;   // where its data physically lived
-
-    // scratch, needed by the extent callback
-    TSK_OFF_T fs_offset;
+    std::vector<ByteRange> extents;
+    TSK_OFF_T fs_offset;         // scratch for the extent callback
     unsigned int block_size;
 };
 
@@ -271,18 +442,18 @@ struct Phase1Ctx {
     TSK_OFF_T fs_offset;
     unsigned int block_size;
     std::vector<DeletedFile> deleted;
+    std::vector<FileReport> *reports;    // Phase 5 accumulator
+    magic_t magic;
+    const std::vector<Signature> *sigs;
 };
 
-// Records the physical blocks a file occupied. AONLY means TSK gives us
-// addresses without reading content, which is all we need here.
 static TSK_WALK_RET_ENUM
 file_extent_cb(TSK_FS_FILE *fs_file, TSK_OFF_T off, TSK_DADDR_T addr,
                char *buf, size_t len, TSK_FS_BLOCK_FLAG_ENUM flags, void *ptr) {
     DeletedFile *df = (DeletedFile *)ptr;
-    if (addr == 0 || len == 0) return TSK_WALK_CONT;   // sparse / no block
+    if (addr == 0 || len == 0) return TSK_WALK_CONT;
 
     TSK_OFF_T bstart = df->fs_offset + (TSK_OFF_T)addr * (TSK_OFF_T)df->block_size;
-
     if (!df->extents.empty() &&
         df->extents.back().start + df->extents.back().length == bstart) {
         df->extents.back().length += (TSK_OFF_T)len;
@@ -309,64 +480,77 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
     Phase1Ctx *ctx = (Phase1Ctx *)ptr;
 
     if (fs_file->name == NULL) return TSK_WALK_CONT;
-    if (strcmp(fs_file->name->name, ".") == 0 ||
-        strcmp(fs_file->name->name, "..") == 0) return TSK_WALK_CONT;
+    const char *nm = fs_file->name->name;
+    if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) return TSK_WALK_CONT;
+    if (nm[0] == '$') return TSK_WALK_CONT;          // TSK pseudo-files
 
     bool deleted = (fs_file->name->flags & TSK_FS_NAME_FLAG_UNALLOC) != 0;
 
-    printf("%s%-30s  %s", path, fs_file->name->name,
-           deleted ? "[DELETED]" : "[present]");
+    printf("%s%-30s  %s", path, nm, deleted ? "[DELETED]" : "[present]");
     if (fs_file->meta != NULL) printf("  size=%lld", (long long)fs_file->meta->size);
     else                       printf("  (metadata gone)");
     printf("\n");
 
-    if (!deleted || fs_file->meta == NULL || fs_file->meta->size <= 0) {
-        return TSK_WALK_CONT;
-    }
+    if (fs_file->meta == NULL || fs_file->meta->size <= 0) return TSK_WALK_CONT;
 
-    // --- extract content ----------------------------------------
     TSK_OFF_T size = fs_file->meta->size;
-    char *buf = new char[size];
-    ssize_t got = tsk_fs_file_read(fs_file, 0, buf, size, TSK_FS_FILE_READ_FLAG_NONE);
-    if (got > 0) {
+    size_t readlen = (size_t)((size > (TSK_OFF_T)SCAN_CAP) ? (TSK_OFF_T)SCAN_CAP : size);
+
+    std::vector<unsigned char> data(readlen);
+    ssize_t got = tsk_fs_file_read(fs_file, 0, (char *)&data[0], readlen,
+                                   TSK_FS_FILE_READ_FLAG_NONE);
+    if (got <= 0) return TSK_WALK_CONT;
+    data.resize((size_t)got);
+
+    // Deleted files get written out; live files are scanned in memory only.
+    if (deleted) {
         mkdir("recovered", 0755);
         char outpath[512];
-        snprintf(outpath, sizeof(outpath), "recovered/%s", fs_file->name->name);
+        snprintf(outpath, sizeof(outpath), "recovered/%s", nm);
         FILE *out = fopen(outpath, "wb");
         if (out) {
-            fwrite(buf, 1, got, out);
+            fwrite(&data[0], 1, data.size(), out);
             fclose(out);
-            printf("    -> recovered %zd bytes to %s\n", got, outpath);
+            printf("    -> recovered %zu bytes to %s\n", data.size(), outpath);
         }
-    }
-    delete[] buf;
 
-    // --- record where its data lived, for later reconciliation ---
-    DeletedFile df;
-    df.name = fs_file->name->name;
-    df.size = fs_file->meta->size;
-    df.mtime = (time_t)fs_file->meta->mtime;
-    df.crtime = (time_t)fs_file->meta->crtime;
-    df.fs_offset = ctx->fs_offset;
-    df.block_size = ctx->block_size;
+        DeletedFile df;
+        df.name = nm;
+        df.size = fs_file->meta->size;
+        df.mtime = (time_t)fs_file->meta->mtime;
+        df.crtime = (time_t)fs_file->meta->crtime;
+        df.fs_offset = ctx->fs_offset;
+        df.block_size = ctx->block_size;
+        tsk_fs_file_walk(fs_file, TSK_FS_FILE_WALK_FLAG_AONLY, file_extent_cb, &df);
 
-    tsk_fs_file_walk(fs_file, TSK_FS_FILE_WALK_FLAG_AONLY, file_extent_cb, &df);
-
-    if (!df.extents.empty()) {
-        printf("    extents:");
-        for (size_t i = 0; i < df.extents.size() && i < 4; i++) {
-            printf(" [%lld+%lld]", (long long)df.extents[i].start,
-                                   (long long)df.extents[i].length);
+        if (!df.extents.empty()) {
+            printf("    extents:");
+            for (size_t i = 0; i < df.extents.size() && i < 4; i++) {
+                printf(" [%lld+%lld]", (long long)df.extents[i].start,
+                                       (long long)df.extents[i].length);
+            }
+            if (df.extents.size() > 4) printf(" ... (%zu total)", df.extents.size());
+            printf("\n");
         }
-        if (df.extents.size() > 4) printf(" ... (%zu total)", df.extents.size());
-        printf("\n");
+        ctx->deleted.push_back(df);
     }
 
-    ctx->deleted.push_back(df);
+    // --- Phase 5 scan -------------------------------------------
+    FileReport fr;
+    fr.source = deleted ? "recovered" : "live";
+    fr.name = nm;
+    fr.size = (long long)fs_file->meta->size;
+    fr.detected = "(unknown)";
+    if (ctx->magic != NULL) {
+        const char *desc = magic_buffer(ctx->magic, &data[0], data.size());
+        if (desc) fr.detected = desc;
+    }
+    fr.findings = scan_content(&data[0], data.size(), fr.detected, *ctx->sigs);
+    if (!fr.findings.empty()) ctx->reports->push_back(fr);
+
     return TSK_WALK_CONT;
 }
 
-// Which deleted file, if any, owned the byte at this offset?
 static const DeletedFile *
 find_owner(const std::vector<DeletedFile> &dels, TSK_OFF_T off) {
     for (size_t i = 0; i < dels.size(); i++) {
@@ -389,7 +573,7 @@ static std::string sanitize(const std::string &s) {
 }
 
 // ===============================================================
-// Unallocated space mapping
+// Phase 2
 // ===============================================================
 
 struct UnallocState {
@@ -430,7 +614,7 @@ struct CarveResult {
     std::string claimed;
     std::string detected;
     std::string method;
-    std::string origname;    // recovered via reconciliation, "" if none
+    std::string origname;
     std::string origtime;
     Verdict verdict;
 };
@@ -438,7 +622,9 @@ struct CarveResult {
 static void carve_runs(TSK_IMG_INFO *img,
                        const std::vector<ByteRange> &runs,
                        const std::vector<Signature> &sigs,
-                       const std::vector<DeletedFile> &deleted) {
+                       const std::vector<DeletedFile> &deleted,
+                       magic_t magic,
+                       std::vector<FileReport> *reports) {
     const size_t CHUNK = 1024 * 1024;
 
     size_t max_pat = 1;
@@ -451,7 +637,6 @@ static void carve_runs(TSK_IMG_INFO *img,
     std::vector<Hit> headers, footers;
     std::vector<unsigned char> buf(CHUNK + OVERLAP);
 
-    // ---- Pass 1: locate headers and footers ---------------------
     for (size_t r = 0; r < runs.size(); r++) {
         TSK_OFF_T run_start = runs[r].start;
         TSK_OFF_T run_end   = run_start + runs[r].length;
@@ -490,13 +675,6 @@ static void carve_runs(TSK_IMG_INFO *img,
     printf("Pass 1: %zu header hit(s), %zu footer hit(s)\n\n",
            headers.size(), footers.size());
 
-    magic_t magic = magic_open(MAGIC_NONE);
-    if (magic == NULL || magic_load(magic, NULL) != 0) {
-        fprintf(stderr, "Warning: libmagic unavailable, skipping validation\n");
-        if (magic) { magic_close(magic); magic = NULL; }
-    }
-
-    // ---- Pass 2: extract, validate, reconcile -------------------
     mkdir("carved", 0755);
     std::vector<CarveResult> results;
     int carved_count = 0, skipped = 0, reconciled = 0;
@@ -513,7 +691,6 @@ static void carve_runs(TSK_IMG_INFO *img,
         bool confident = false;
         bool structure_failed = false;
 
-        // --- (a) format-aware end detection -----------------------
         if (is_jpeg_ext(sig.ext)) {
             TSK_OFF_T window = (TSK_OFF_T)sig.max_size;
             if (start + window > img->size) window = img->size - start;
@@ -533,7 +710,6 @@ static void carve_runs(TSK_IMG_INFO *img,
             }
         }
 
-        // --- (b) footer search ------------------------------------
         if (end == -1 && !sig.footer.empty()) {
             TSK_OFF_T limit = start + (TSK_OFF_T)sig.max_size;
             for (size_t f = 0; f < footers.size(); f++) {
@@ -543,8 +719,6 @@ static void carve_runs(TSK_IMG_INFO *img,
 
                 TSK_OFF_T fo = footers[f].offset;
                 if (sig.ext == "zip") {
-                    // End-of-central-directory: 22 fixed bytes plus a
-                    // comment whose length is in the last 2 bytes.
                     unsigned char eocd[22];
                     if (tsk_img_read(img, fo, (char *)eocd, 22) == 22) {
                         size_t comment = (size_t)eocd[20] | ((size_t)eocd[21] << 8);
@@ -561,7 +735,6 @@ static void carve_runs(TSK_IMG_INFO *img,
             }
         }
 
-        // --- (c) bound by next header -----------------------------
         if (end == -1) {
             TSK_OFF_T bound = start + (TSK_OFF_T)sig.max_size;
             for (size_t n = h + 1; n < headers.size(); n++) {
@@ -579,7 +752,6 @@ static void carve_runs(TSK_IMG_INFO *img,
         TSK_OFF_T len = end - start;
         if (len <= 0) continue;
 
-        // --- reconciliation: did a deleted file own these bytes? ---
         const DeletedFile *owner = find_owner(deleted, start);
 
         char outpath[512];
@@ -591,26 +763,31 @@ static void carve_runs(TSK_IMG_INFO *img,
                      carved_count, sig.ext.c_str());
         }
 
+        // Hold the candidate in memory (up to SCAN_CAP) so it can be
+        // written and content-scanned without a second read.
+        size_t hold = (size_t)((len > (TSK_OFF_T)SCAN_CAP) ? (TSK_OFF_T)SCAN_CAP : len);
+        std::vector<unsigned char> filedata(hold);
+        ssize_t held = tsk_img_read(img, start, (char *)&filedata[0], hold);
+        if (held <= 0) continue;
+        filedata.resize((size_t)held);
+
         FILE *out = fopen(outpath, "wb");
         if (out == NULL) continue;
-
-        const size_t SNIFF = 1024 * 1024;
-        std::vector<char> sniff;
-        std::vector<char> data(65536);
-        TSK_OFF_T remaining = len, at = start;
-        while (remaining > 0) {
-            size_t want = data.size();
-            if ((TSK_OFF_T)want > remaining) want = (size_t)remaining;
-            ssize_t got = tsk_img_read(img, at, &data[0], want);
-            if (got <= 0) break;
-            fwrite(&data[0], 1, got, out);
-            if (sniff.size() < SNIFF) {
-                size_t take = SNIFF - sniff.size();
-                if (take > (size_t)got) take = (size_t)got;
-                sniff.insert(sniff.end(), data.begin(), data.begin() + take);
+        fwrite(&filedata[0], 1, filedata.size(), out);
+        // Anything past SCAN_CAP is streamed straight through.
+        if (len > (TSK_OFF_T)filedata.size()) {
+            std::vector<char> tmp(65536);
+            TSK_OFF_T at = start + (TSK_OFF_T)filedata.size();
+            TSK_OFF_T remaining = len - (TSK_OFF_T)filedata.size();
+            while (remaining > 0) {
+                size_t want = tmp.size();
+                if ((TSK_OFF_T)want > remaining) want = (size_t)remaining;
+                ssize_t got = tsk_img_read(img, at, &tmp[0], want);
+                if (got <= 0) break;
+                fwrite(&tmp[0], 1, got, out);
+                at += got;
+                remaining -= got;
             }
-            at += got;
-            remaining -= got;
         }
         fclose(out);
 
@@ -625,17 +802,12 @@ static void carve_runs(TSK_IMG_INFO *img,
         res.origname = (owner != NULL) ? owner->name : "";
         res.origtime = (owner != NULL) ? fmt_time(owner->mtime) : "";
 
-        if (magic != NULL && !sniff.empty()) {
-            const char *desc = magic_buffer(magic, &sniff[0], sniff.size());
+        if (magic != NULL) {
+            const char *desc = magic_buffer(magic, &filedata[0], filedata.size());
             res.detected = (desc != NULL) ? desc : "(null)";
             res.verdict = classify(sig.ext, res.detected);
         }
-
-        // libmagic only reads the head of a file, so it calls a
-        // fragmented JPEG valid. The structural walk knows better.
-        if (structure_failed && res.verdict == V_VALID) {
-            res.verdict = V_FRAGMENTED;
-        }
+        if (structure_failed && res.verdict == V_VALID) res.verdict = V_FRAGMENTED;
 
         std::string shortdesc = res.detected;
         if (shortdesc.size() > 40) shortdesc = shortdesc.substr(0, 37) + "...";
@@ -650,12 +822,19 @@ static void carve_runs(TSK_IMG_INFO *img,
             reconciled++;
         }
 
+        // --- Phase 5 scan of the carved candidate ---------------
+        FileReport fr;
+        fr.source = "carved";
+        fr.name = outpath;
+        fr.size = (long long)len;
+        fr.detected = res.detected;
+        fr.findings = scan_content(&filedata[0], filedata.size(), res.detected, sigs);
+        if (!fr.findings.empty()) reports->push_back(fr);
+
         results.push_back(res);
         carved_count++;
         if (confident) skip_until = end;
     }
-
-    if (magic) magic_close(magic);
 
     int nv = 0, np = 0, nf = 0, nm = 0, nu = 0;
     for (size_t i = 0; i < results.size(); i++) {
@@ -687,11 +866,9 @@ static void carve_runs(TSK_IMG_INFO *img,
             std::string d = results[i].detected;
             for (size_t j = 0; j < d.size(); j++) if (d[j] == ',') d[j] = ';';
             fprintf(rep, "%s,%s,%s,%lld,%lld,%s,%s,%s,%s\n",
-                    results[i].path.c_str(),
-                    verdict_name(results[i].verdict),
+                    results[i].path.c_str(), verdict_name(results[i].verdict),
                     results[i].claimed.c_str(),
-                    (long long)results[i].offset,
-                    (long long)results[i].size,
+                    (long long)results[i].offset, (long long)results[i].size,
                     results[i].method.c_str(),
                     results[i].origname.empty() ? "-" : results[i].origname.c_str(),
                     results[i].origtime.empty() ? "-" : results[i].origtime.c_str(),
@@ -699,6 +876,88 @@ static void carve_runs(TSK_IMG_INFO *img,
         }
         fclose(rep);
         printf("\nReport written to carved/report.txt\n");
+    }
+}
+
+// ===============================================================
+// Phase 5 output
+// ===============================================================
+
+static void print_threat_report(std::vector<FileReport> &reports) {
+    printf("\n=== Phase 5: content triage ===\n\n");
+
+    if (reports.empty()) {
+        printf("  No polyglot structure or suspicious content found.\n");
+        return;
+    }
+
+    // Highest-severity files first: that is the triage order an
+    // investigator actually wants.
+    for (size_t i = 0; i < reports.size(); i++) {
+        int worst = 0;
+        for (size_t j = 0; j < reports[i].findings.size(); j++) {
+            int r = severity_rank(reports[i].findings[j].severity);
+            if (r > worst) worst = r;
+        }
+        reports[i].size = reports[i].size;   // (no-op, keeps struct simple)
+        // stash rank in findings order instead of adding a field
+        std::sort(reports[i].findings.begin(), reports[i].findings.end(),
+                  [](const Finding &a, const Finding &b) {
+                      return severity_rank(a.severity) > severity_rank(b.severity);
+                  });
+    }
+
+    std::sort(reports.begin(), reports.end(),
+              [](const FileReport &a, const FileReport &b) {
+                  int ra = 0, rb = 0;
+                  for (size_t i = 0; i < a.findings.size(); i++)
+                      ra = std::max(ra, severity_rank(a.findings[i].severity));
+                  for (size_t i = 0; i < b.findings.size(); i++)
+                      rb = std::max(rb, severity_rank(b.findings[i].severity));
+                  return ra > rb;
+              });
+
+    int high = 0, susp = 0, info = 0;
+
+    for (size_t i = 0; i < reports.size(); i++) {
+        const FileReport &fr = reports[i];
+        std::string d = fr.detected;
+        if (d.size() > 52) d = d.substr(0, 49) + "...";
+        printf("  [%s] %s  (%lld bytes)\n", fr.source.c_str(), fr.name.c_str(), fr.size);
+        printf("      type: %s\n", d.c_str());
+        for (size_t j = 0; j < fr.findings.size(); j++) {
+            const Finding &f = fr.findings[j];
+            printf("      %-11s %s  @ offset %lld\n",
+                   f.severity.c_str(), f.label.c_str(), f.offset);
+            if (f.severity == "HIGH") high++;
+            else if (f.severity == "SUSPICIOUS") susp++;
+            else info++;
+        }
+        printf("\n");
+    }
+
+    printf("--- Triage summary ---\n");
+    printf("  Files with findings : %zu\n", reports.size());
+    printf("  HIGH                : %d\n", high);
+    printf("  SUSPICIOUS          : %d\n", susp);
+    printf("  INFO                : %d\n", info);
+
+    FILE *tf = fopen("threats.csv", "w");
+    if (tf) {
+        fprintf(tf, "source,file,size,severity,finding,offset,detected_type\n");
+        for (size_t i = 0; i < reports.size(); i++) {
+            std::string d = reports[i].detected;
+            for (size_t j = 0; j < d.size(); j++) if (d[j] == ',') d[j] = ';';
+            for (size_t j = 0; j < reports[i].findings.size(); j++) {
+                const Finding &f = reports[i].findings[j];
+                fprintf(tf, "%s,%s,%lld,%s,%s,%lld,%s\n",
+                        reports[i].source.c_str(), reports[i].name.c_str(),
+                        reports[i].size, f.severity.c_str(), f.label.c_str(),
+                        f.offset, d.c_str());
+            }
+        }
+        fclose(tf);
+        printf("\nTriage report written to threats.csv\n");
     }
 }
 
@@ -729,6 +988,13 @@ int main(int argc, char **argv) {
         printf("Using %zu built-in signature(s)\n\n", sigs.size());
     }
 
+    magic_t magic = magic_open(MAGIC_NONE);
+    if (magic == NULL || magic_load(magic, NULL) != 0) {
+        fprintf(stderr, "Warning: libmagic unavailable, validation disabled\n");
+        if (magic) { magic_close(magic); magic = NULL; }
+    }
+
+    std::vector<FileReport> reports;
     std::vector<ByteRange> runs;
     std::vector<DeletedFile> deleted;
     TSK_FS_INFO *fs = NULL;
@@ -761,6 +1027,9 @@ int main(int argc, char **argv) {
         Phase1Ctx ctx;
         ctx.fs_offset = fs_offset;
         ctx.block_size = fs->block_size;
+        ctx.reports = &reports;
+        ctx.magic = magic;
+        ctx.sigs = &sigs;
 
         TSK_FS_DIR_WALK_FLAG_ENUM wf = (TSK_FS_DIR_WALK_FLAG_ENUM)
             (TSK_FS_DIR_WALK_FLAG_ALLOC | TSK_FS_DIR_WALK_FLAG_UNALLOC |
@@ -797,8 +1066,11 @@ int main(int argc, char **argv) {
            runs.size(), (long long)total, total / (1024.0 * 1024.0));
 
     printf("=== Phase 3/4: carving, validation, reconciliation ===\n\n");
-    carve_runs(img, runs, sigs, deleted);
+    carve_runs(img, runs, sigs, deleted, magic, &reports);
 
+    print_threat_report(reports);
+
+    if (magic) magic_close(magic);
     if (fs) tsk_fs_close(fs);
     if (vs) tsk_vs_close(vs);
     tsk_img_close(img);
