@@ -1,6 +1,26 @@
 // main.cpp
+// Carver -- disk image recovery and content triage
+// Copyright (C) 2026 Jackson Stack
 //
-// Disk image recovery and triage tool combining three open source projects:
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, see <https://www.gnu.org/licenses/>.
+//
+// This program adapts the signature configuration format and two-pass
+// carving design of Scalpel (https://github.com/sleuthkit/scalpel),
+// which is licensed under the GPL. It links against The Sleuth Kit,
+// libmagic and YARA; see README.md for their respective licenses.
+//
+// Disk image recovery and triage tool combining four open source projects:
 //
 //   * The Sleuth Kit (libtsk)  -- filesystem parsing, deleted file
 //                                 metadata recovery, unallocated space
@@ -9,6 +29,8 @@
 //                                 two-pass header/footer carving
 //                                 approach, ported into carve_runs().
 //   * libmagic (file)          -- content-based type identification.
+//   * YARA                     -- rule engine for malicious content,
+//                                 rules loaded from ./rules/*.yar
 //
 // Pipeline:
 //   Phase 1  metadata-based recovery of deleted files, recording the
@@ -20,19 +42,19 @@
 //            extents to recover original filenames and timestamps
 //   Phase 5  content triage: scan every file -- live, recovered and
 //            carved -- for polyglot structure, embedded formats,
-//            appended data and script/executable indicators
+//            appended data, script indicators and YARA rule matches
 //
-// Phase 5 exists because recovering a deleted file is only half the
-// job during an incident: attackers delete their tooling, so the
-// recovered set is exactly where malicious content is most likely to
-// be. Recovering and triaging in one pass is the workflow that
-// currently requires stitching separate tools together.
+// Phase 5 exists because recovering a deleted file is only half the job
+// during an incident: attackers delete their tooling, so the recovered
+// set is exactly where malicious content is most likely to be.
 //
 // Build:  make
 // Run:    ./carver <image> [scalpel.conf]
 
 #include <tsk/libtsk.h>
 #include <magic.h>
+#include <yara.h>
+#include <dirent.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -60,7 +82,7 @@ struct Signature {
     std::vector<unsigned char> footer;   // empty == no footer
 };
 
-// Largest file we will hold in memory for content scanning.
+// Largest file held in memory for content scanning.
 static const size_t SCAN_CAP = 64u * 1024u * 1024u;
 
 // ===============================================================
@@ -252,21 +274,6 @@ static Verdict classify(const std::string &ext, const std::string &desc) {
 // ===============================================================
 // PHASE 5: content triage
 // ===============================================================
-//
-// Three classes of finding:
-//
-//   1. Embedded format signatures. A second format's magic bytes
-//      appearing inside a file. Normal inside containers (ZIP, OLE,
-//      PDF) -- images legitimately live inside Word documents -- but
-//      highly suspicious inside a flat image format.
-//
-//   2. Appended data. For JPEG we know the true structural end, so
-//      anything past it was deliberately attached. This is the classic
-//      polyglot / stego carrier construction.
-//
-//   3. Script and executable indicators. Severity depends on the host:
-//      <script> in an HTML file is unremarkable; the same bytes inside
-//      a JPEG are not.
 
 struct Finding {
     std::string severity;    // INFO / SUSPICIOUS / HIGH
@@ -302,9 +309,11 @@ struct Indicator {
     const char *label;
     const char *pat;
     size_t len;
-    bool binary_ok;   // meaningful even in binary files
+    bool binary_ok;
 };
 
+// Kept as a fallback so the tool still reports something useful when no
+// YARA rules are installed.
 static const Indicator INDICATORS[] = {
     { "Windows PE executable stub", "This program cannot be run in DOS mode", 38, true },
     { "ELF executable header",      "\x7f" "ELF", 4, true },
@@ -332,6 +341,88 @@ static bool mem_find(const unsigned char *d, size_t n,
     return false;
 }
 
+// ---------------------------------------------------------------
+// YARA
+// ---------------------------------------------------------------
+
+static YR_RULES *g_yara = NULL;
+
+struct YaraCtx { std::vector<Finding> *out; };
+
+// YARA 4.x callback signature. If you are on YARA 3.x the first
+// parameter (YR_SCAN_CONTEXT *) does not exist -- drop it.
+static int yara_cb(YR_SCAN_CONTEXT *context, int message,
+                   void *message_data, void *user_data) {
+    (void)context;
+    if (message != CALLBACK_MSG_RULE_MATCHING) return CALLBACK_CONTINUE;
+
+    YR_RULE *rule = (YR_RULE *)message_data;
+    YaraCtx *y = (YaraCtx *)user_data;
+
+    // Rules carry their own severity and description in metadata, so
+    // adding a rule needs no code change here.
+    const char *sev = "SUSPICIOUS";
+    const char *desc = NULL;
+    YR_META *meta;
+    yr_rule_metas_foreach(rule, meta) {
+        if (meta->type != META_TYPE_STRING) continue;
+        if (strcmp(meta->identifier, "severity") == 0)    sev = meta->string;
+        if (strcmp(meta->identifier, "description") == 0) desc = meta->string;
+    }
+
+    Finding f;
+    f.severity = sev;
+    f.offset = 0;
+    f.label = std::string("YARA:") + rule->identifier;
+    if (desc) f.label += std::string(" - ") + desc;
+    y->out->push_back(f);
+
+    return CALLBACK_CONTINUE;
+}
+
+static YR_RULES *load_yara_rules(const char *dir, int *rule_count) {
+    *rule_count = 0;
+
+    YR_COMPILER *comp = NULL;
+    if (yr_compiler_create(&comp) != ERROR_SUCCESS) return NULL;
+
+    DIR *d = opendir(dir);
+    int files_added = 0;
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            size_t l = strlen(e->d_name);
+            if (l < 5 || strcmp(e->d_name + l - 4, ".yar") != 0) continue;
+
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+            FILE *f = fopen(path, "r");
+            if (f == NULL) continue;
+
+            int errs = yr_compiler_add_file(comp, f, NULL, path);
+            fclose(f);
+            if (errs == 0) files_added++;
+            else fprintf(stderr, "  YARA: %d error(s) compiling %s\n", errs, path);
+        }
+        closedir(d);
+    }
+
+    if (files_added == 0) { yr_compiler_destroy(comp); return NULL; }
+
+    YR_RULES *rules = NULL;
+    if (yr_compiler_get_rules(comp, &rules) != ERROR_SUCCESS) {
+        yr_compiler_destroy(comp);
+        return NULL;
+    }
+    yr_compiler_destroy(comp);
+
+    YR_RULE *r;
+    yr_rules_foreach(rules, r) { (*rule_count)++; }
+    return rules;
+}
+
+// ---------------------------------------------------------------
+
 static std::vector<Finding>
 scan_content(const unsigned char *d, size_t n,
              const std::string &detected,
@@ -344,18 +435,15 @@ scan_content(const unsigned char *d, size_t n,
     bool textual   = type_is_text(detected);
 
     // --- (1) embedded format signatures -------------------------
-    // Skip offset 0: that is the file's own type. Report at most one
-    // hit per format so a big archive does not produce noise.
     std::vector<std::string> seen;
     for (size_t i = 1; i < n; i++) {
         for (size_t s = 0; s < sigs.size(); s++) {
             if (!sig_match(d + i, n - i, sigs[s].header, sigs[s].case_sensitive)) continue;
-
             if (std::find(seen.begin(), seen.end(), sigs[s].ext) != seen.end()) continue;
             seen.push_back(sigs[s].ext);
 
             // Same format nested in itself is routine: JPEGs carry Exif
-            // thumbnails, archives contain archives. Only a *foreign*
+            // thumbnails, archives contain archives. Only a foreign
             // format inside a flat file suggests a polyglot carrier.
             bool same_as_host = false;
             std::vector<std::string> want = expected_for(sigs[s].ext);
@@ -366,9 +454,9 @@ scan_content(const unsigned char *d, size_t n,
             Finding f;
             f.offset = (long long)i;
             f.label = "embedded " + sigs[s].ext + " signature";
-            if (same_as_host)   f.severity = "INFO";        // thumbnail / nesting
-            else if (container) f.severity = "INFO";        // normal nesting
-            else if (flat_img)  f.severity = "HIGH";        // polyglot carrier
+            if (same_as_host)   f.severity = "INFO";
+            else if (container) f.severity = "INFO";
+            else if (flat_img)  f.severity = "HIGH";
             else                f.severity = "SUSPICIOUS";
             out.push_back(f);
         }
@@ -379,7 +467,7 @@ scan_content(const unsigned char *d, size_t n,
         size_t truelen = jpeg_true_length(d, n);
         if (truelen > 0 && truelen < n) {
             size_t extra = n - truelen;
-            if (extra > 16) {          // ignore trivial padding
+            if (extra > 16) {
                 Finding f;
                 f.severity = "HIGH";
                 f.offset = (long long)truelen;
@@ -392,7 +480,7 @@ scan_content(const unsigned char *d, size_t n,
         }
     }
 
-    // --- (3) script / executable indicators ---------------------
+    // --- (3) built-in indicator strings -------------------------
     for (size_t k = 0; k < sizeof(INDICATORS)/sizeof(INDICATORS[0]); k++) {
         size_t at = 0;
         if (!mem_find(d, n, INDICATORS[k].pat, INDICATORS[k].len, &at)) continue;
@@ -400,19 +488,17 @@ scan_content(const unsigned char *d, size_t n,
         Finding f;
         f.offset = (long long)at;
         f.label = INDICATORS[k].label;
-
-        if (flat_img) {
-            // Executable or script content inside a flat image is the
-            // signature of a weaponised file.
-            f.severity = "HIGH";
-        } else if (textual && !INDICATORS[k].binary_ok) {
-            f.severity = "INFO";       // scripts in HTML are expected
-        } else if (container) {
-            f.severity = "SUSPICIOUS";
-        } else {
-            f.severity = "SUSPICIOUS";
-        }
+        if (flat_img)                                  f.severity = "HIGH";
+        else if (textual && !INDICATORS[k].binary_ok)  f.severity = "INFO";
+        else                                           f.severity = "SUSPICIOUS";
         out.push_back(f);
+    }
+
+    // --- (4) YARA rules -----------------------------------------
+    if (g_yara != NULL) {
+        YaraCtx yc;
+        yc.out = &out;
+        yr_rules_scan_mem(g_yara, (const uint8_t *)d, n, 0, yara_cb, &yc, 0);
     }
 
     return out;
@@ -425,7 +511,7 @@ static int severity_rank(const std::string &s) {
 }
 
 // ===============================================================
-// Phase 1: deleted files and their extents
+// Phase 1
 // ===============================================================
 
 struct DeletedFile {
@@ -434,7 +520,7 @@ struct DeletedFile {
     time_t mtime;
     time_t crtime;
     std::vector<ByteRange> extents;
-    TSK_OFF_T fs_offset;         // scratch for the extent callback
+    TSK_OFF_T fs_offset;
     unsigned int block_size;
 };
 
@@ -442,7 +528,7 @@ struct Phase1Ctx {
     TSK_OFF_T fs_offset;
     unsigned int block_size;
     std::vector<DeletedFile> deleted;
-    std::vector<FileReport> *reports;    // Phase 5 accumulator
+    std::vector<FileReport> *reports;
     magic_t magic;
     const std::vector<Signature> *sigs;
 };
@@ -502,7 +588,7 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
     if (got <= 0) return TSK_WALK_CONT;
     data.resize((size_t)got);
 
-    // Deleted files get written out; live files are scanned in memory only.
+    // Deleted files are written out; live files are scanned in memory only.
     if (deleted) {
         mkdir("recovered", 0755);
         char outpath[512];
@@ -535,7 +621,6 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
         ctx->deleted.push_back(df);
     }
 
-    // --- Phase 5 scan -------------------------------------------
     FileReport fr;
     fr.source = deleted ? "recovered" : "live";
     fr.name = nm;
@@ -763,8 +848,6 @@ static void carve_runs(TSK_IMG_INFO *img,
                      carved_count, sig.ext.c_str());
         }
 
-        // Hold the candidate in memory (up to SCAN_CAP) so it can be
-        // written and content-scanned without a second read.
         size_t hold = (size_t)((len > (TSK_OFF_T)SCAN_CAP) ? (TSK_OFF_T)SCAN_CAP : len);
         std::vector<unsigned char> filedata(hold);
         ssize_t held = tsk_img_read(img, start, (char *)&filedata[0], hold);
@@ -774,7 +857,6 @@ static void carve_runs(TSK_IMG_INFO *img,
         FILE *out = fopen(outpath, "wb");
         if (out == NULL) continue;
         fwrite(&filedata[0], 1, filedata.size(), out);
-        // Anything past SCAN_CAP is streamed straight through.
         if (len > (TSK_OFF_T)filedata.size()) {
             std::vector<char> tmp(65536);
             TSK_OFF_T at = start + (TSK_OFF_T)filedata.size();
@@ -822,7 +904,6 @@ static void carve_runs(TSK_IMG_INFO *img,
             reconciled++;
         }
 
-        // --- Phase 5 scan of the carved candidate ---------------
         FileReport fr;
         fr.source = "carved";
         fr.name = outpath;
@@ -891,22 +972,14 @@ static void print_threat_report(std::vector<FileReport> &reports) {
         return;
     }
 
-    // Highest-severity files first: that is the triage order an
-    // investigator actually wants.
     for (size_t i = 0; i < reports.size(); i++) {
-        int worst = 0;
-        for (size_t j = 0; j < reports[i].findings.size(); j++) {
-            int r = severity_rank(reports[i].findings[j].severity);
-            if (r > worst) worst = r;
-        }
-        reports[i].size = reports[i].size;   // (no-op, keeps struct simple)
-        // stash rank in findings order instead of adding a field
         std::sort(reports[i].findings.begin(), reports[i].findings.end(),
                   [](const Finding &a, const Finding &b) {
                       return severity_rank(a.severity) > severity_rank(b.severity);
                   });
     }
 
+    // Highest-severity files first: the triage order an investigator wants.
     std::sort(reports.begin(), reports.end(),
               [](const FileReport &a, const FileReport &b) {
                   int ra = 0, rb = 0;
@@ -950,9 +1023,11 @@ static void print_threat_report(std::vector<FileReport> &reports) {
             for (size_t j = 0; j < d.size(); j++) if (d[j] == ',') d[j] = ';';
             for (size_t j = 0; j < reports[i].findings.size(); j++) {
                 const Finding &f = reports[i].findings[j];
+                std::string lbl = f.label;
+                for (size_t k = 0; k < lbl.size(); k++) if (lbl[k] == ',') lbl[k] = ';';
                 fprintf(tf, "%s,%s,%lld,%s,%s,%lld,%s\n",
                         reports[i].source.c_str(), reports[i].name.c_str(),
-                        reports[i].size, f.severity.c_str(), f.label.c_str(),
+                        reports[i].size, f.severity.c_str(), lbl.c_str(),
                         f.offset, d.c_str());
             }
         }
@@ -982,10 +1057,10 @@ int main(int argc, char **argv) {
 
     std::vector<Signature> sigs;
     if (argc >= 3 && load_conf(argv[2], sigs)) {
-        printf("Loaded %zu signature(s) from %s\n\n", sigs.size(), argv[2]);
+        printf("Loaded %zu signature(s) from %s\n", sigs.size(), argv[2]);
     } else {
         load_default_signatures(sigs);
-        printf("Using %zu built-in signature(s)\n\n", sigs.size());
+        printf("Using %zu built-in signature(s)\n", sigs.size());
     }
 
     magic_t magic = magic_open(MAGIC_NONE);
@@ -993,6 +1068,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warning: libmagic unavailable, validation disabled\n");
         if (magic) { magic_close(magic); magic = NULL; }
     }
+
+    if (yr_initialize() == ERROR_SUCCESS) {
+        int nrules = 0;
+        g_yara = load_yara_rules("rules", &nrules);
+        if (g_yara != NULL) printf("Loaded %d YARA rule(s) from ./rules\n", nrules);
+        else                printf("No YARA rules loaded (./rules missing or empty)\n");
+    } else {
+        fprintf(stderr, "Warning: YARA failed to initialise\n");
+    }
+    printf("\n");
 
     std::vector<FileReport> reports;
     std::vector<ByteRange> runs;
@@ -1070,6 +1155,8 @@ int main(int argc, char **argv) {
 
     print_threat_report(reports);
 
+    if (g_yara) yr_rules_destroy(g_yara);
+    yr_finalize();
     if (magic) magic_close(magic);
     if (fs) tsk_fs_close(fs);
     if (vs) tsk_vs_close(vs);
