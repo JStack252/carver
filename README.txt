@@ -1,158 +1,177 @@
+# Carver
 
-Carver
-INTRODUCTION
+## Introduction
 
-Carver is an open source forensic tool that recovers deleted files from disk images and triages the recovered data for malicious content. It combines two recovery techniques that are normally provided by separate tools — metadata-based recovery and signature-based carving — and adds a reconciliation step that links their results together, so that data recovered by carving can be attributed to the file that originally held it.
+Carver is an open source forensic tool that recovers deleted files from disk images and checks the recovered data for malicious content. It brings together two recovery techniques that normally live in separate tools, metadata-based recovery and signature-based carving, and adds a reconciliation step that ties their results together. That step is what lets data pulled out by carving be traced back to the file that originally held it.
 
-Carver is intended for incident response and data recovery work. During an intrusion an attacker will commonly delete the tools and scripts they used, so the deleted set is frequently where the most interesting evidence is. Existing practice requires an investigator to recover files with one tool, carve unallocated space with a second, and scan the results with a third. Carver performs all three in a single pass over the image and produces one report.
+The tool is meant for incident response and data recovery work. When someone breaks into a system they usually delete the tools and scripts they used, so the deleted set is often where the most useful evidence ends up. The usual workflow makes an investigator recover files with one tool, carve unallocated space with a second, and scan the output with a third. Carver does all three in a single pass over the image and writes one report.
 
-Carver uses code and data from The Sleuth Kit, Scalpel, libmagic and YARA. The Sleuth Kit provides all file system parsing. The carving engine follows the two-pass design used by Scalpel and reads Scalpel's signature configuration format. libmagic identifies file content, and YARA provides the rule engine for content triage.
+Carver builds on code and data from The Sleuth Kit, Scalpel, libmagic and YARA. The Sleuth Kit handles all file system parsing. The carving engine follows the two-pass design from Scalpel and reads Scalpel's signature configuration format. libmagic identifies file content, and YARA supplies the rule engine for triage.
 
-As with any investigation tool, results found with Carver should be recreated with a second tool to verify the data. The Sleuth Kit's fls and icat commands are suitable for verifying the metadata recovery stage, and Scalpel itself is suitable for verifying carved output.
+Like any investigation tool, anything Carver finds should be reproduced with a second tool before you rely on it. The Sleuth Kit's `fls` and `icat` commands work for checking the metadata recovery stage, and Scalpel itself works for checking carved output.
 
-OVERVIEW
+## Overview
 
-Carver analyzes a disk or file system image created by dd or a similar application that creates a raw image. Analysis is performed in five phases. Each phase produces results that the following phases consume, and each phase degrades gracefully if the information it needs is unavailable.
+Carver analyzes a disk or file system image made by `dd` or any similar tool that produces a raw image. Analysis runs in five phases. Each phase produces results the next phase uses, and each one degrades gracefully when the information it needs isn't there.
 
-Phase 1 — Metadata Recovery
+### Phase 1: Metadata recovery
 
-When a file is deleted, most file systems mark its directory entry and data blocks as free without erasing either. Until those structures are reused, the file's name, timestamps, size, and block list all remain readable.
+When a file is deleted, most file systems just mark its directory entry and data blocks as free without actually erasing either one. Until those structures get reused, the file's name, timestamps, size, and block list are all still readable.
 
-Carver opens the volume system, locates the first allocated partition, opens the file system within it, and walks the directory tree including unallocated entries. For each deleted file whose metadata survives, the file content is extracted to the recovered/ directory.
+Carver opens the volume system, finds the first allocated partition, opens the file system inside it, and walks the directory tree including the unallocated entries. For each deleted file whose metadata survived, it extracts the content to the `recovered/` directory.
 
-Carver also records the physical byte extents each deleted file occupied. These extents are not needed to recover the file itself; they are recorded so that Phase 4 can determine which deleted file a given region of the disk belonged to.
+Carver also records the physical byte extents each deleted file used to occupy. It doesn't need those extents to recover the file itself. They get recorded so that Phase 4 can work out which deleted file a given region of the disk belonged to.
 
-Phase 2 — Unallocated Space Mapping
+### Phase 2: Unallocated space mapping
 
-Data whose metadata has been destroyed is invisible to Phase 1, but the data itself may still be present in unallocated space.
+A file whose metadata was destroyed is invisible to Phase 1, but the data itself can still be sitting in unallocated space.
 
-Carver walks every unallocated block in the file system and merges consecutive block addresses into contiguous byte ranges. These ranges are the only regions the carving engine will examine. Restricting carving to unallocated space eliminates the largest source of noise in conventional carving: a signature carver run against a whole disk will re-extract every live file it encounters, leaving the investigator to determine which results were actually deleted.
+Carver walks every unallocated block in the file system and merges consecutive block addresses into contiguous byte ranges. Those ranges are the only regions the carving engine will look at. Restricting carving to unallocated space cuts out the biggest source of noise in normal carving: run a signature carver against a whole disk and it re-extracts every live file it hits, which leaves the investigator to sort out which results were actually deleted.
 
-If the image contains no volume system or no recognizable file system — a raw carving target, or a disk whose partition table has been destroyed — Carver treats the entire image as one unallocated range and continues.
+If the image has no volume system or no file system it recognizes, whether that's a raw carving target or a disk whose partition table has been wiped, Carver treats the whole image as one unallocated range and keeps going.
 
-Phase 3 — Signature Carving
+### Phase 3: Signature carving
 
-Carving recovers files by locating format signatures in raw data, without reference to file system structures.
+Carving recovers files by finding format signatures in raw data, without relying on any file system structures.
 
-Carver reads a signature database in Scalpel's configuration format: file extension, case sensitivity, maximum size, header, and optional footer. A built-in set covering JPEG, PNG, GIF, PDF, ZIP, HTML and OLE documents is used when no configuration file is supplied. Scalpel's own scalpel.conf may be passed as the second argument.
+Carver reads a signature database in Scalpel's configuration format: file extension, case sensitivity, maximum size, header, and an optional footer. It uses a built-in set covering JPEG, PNG, GIF, PDF, ZIP, HTML and OLE documents when no configuration file is given. You can also pass Scalpel's own `scalpel.conf` as the second argument.
 
-Carving is performed in two passes. The first pass records the position of every header and footer across the ranges from Phase 2. The second pass pairs them and extracts the results. Reads are performed in chunks with an overlap equal to the longest signature, so that a signature spanning a buffer boundary is not missed.
+Carving runs in two passes. The first pass records the position of every header and footer across the ranges from Phase 2. The second pass pairs them up and extracts the results. Reads happen in chunks with an overlap equal to the longest signature, so a signature that spans a buffer boundary doesn't get missed.
 
-The end of each file is determined by one of three methods, in order of reliability:
+The end of each file is found by one of three methods, listed here from most reliable to least.
 
-Structural parsing is used where the format permits it. For JPEG, Carver walks the segment marker chain the way a decoder would, following declared segment lengths and correctly skipping stuffed bytes and restart markers within entropy-coded data, until it reaches the true end-of-image marker. This avoids the common failure of stopping at the first byte pair that resembles an end marker, which occurs frequently inside compressed image data.
+**Structural parsing** is used wherever the format allows it. For JPEG, Carver walks the segment marker chain the way a decoder would, following the declared segment lengths and correctly skipping stuffed bytes and restart markers inside the entropy-coded data, until it reaches the real end-of-image marker. This avoids the common failure where a tool stops at the first byte pair that looks like an end marker, which happens all the time inside compressed image data.
 
-Footer matching is used for formats with a defined trailer. For ZIP archives the end-of-central-directory record is parsed so that the archive comment is included in the extracted length.
+**Footer matching** is used for formats that have a defined trailer. For ZIP archives, Carver parses the end-of-central-directory record so the archive comment is included in the extracted length.
 
-Next-header bounding is the fallback for formats with no footer, such as OLE documents. The carve is bounded by the next signature of any type, which prevents a single footerless file from consuming the remainder of the image.
+**Next-header bounding** is the fallback for formats with no footer, like OLE documents. The carve is bounded by the next signature of any type, which stops a single footerless file from swallowing the rest of the image.
 
-Phase 4 — Validation and Reconciliation
+### Phase 4: Validation and reconciliation
 
-Carved output is validated against its own content. Each candidate is passed to libmagic and the detected type is compared against the type its signature claimed, producing one of five verdicts:
+Carved output gets validated against its own content. Each candidate goes to libmagic, and the detected type is compared against the type its signature claimed. That produces one of five verdicts:
 
-VALID — content matches the claimed type
-PARTIAL — correct container, but libmagic reports the structure is incomplete
-FRAGMENTED — valid header, but structural parsing failed, indicating the file is not contiguous on disk
-MISMATCH — content is not the claimed type; the signature matched by chance
-UNKNOWN — no validation rule exists for this type
+- **VALID**: content matches the claimed type
+- **PARTIAL**: right container, but libmagic reports the structure is incomplete
+- **FRAGMENTED**: valid header, but structural parsing failed, which means the file isn't contiguous on disk
+- **MISMATCH**: content isn't the claimed type, so the signature matched by chance
+- **UNKNOWN**: no validation rule exists for this type
 
-The FRAGMENTED verdict is derived from the structural parser rather than from libmagic. libmagic reads only the beginning of a file, so it will report a fragmented file as valid. When a file's header parses but its internal structure does not, the file is almost certainly interrupted by foreign data.
+The FRAGMENTED verdict comes from the structural parser, not from libmagic. libmagic only reads the start of a file, so it reports a fragmented file as valid. When a file's header parses but its internal structure doesn't, the file has almost certainly been interrupted by foreign data.
 
-Carver then reconciles carved output against the extents recorded in Phase 1. If a carved candidate begins inside a range that a deleted file occupied, that candidate is renamed with the original file name and reported with the original modification time. This attributes identity to data that carving alone recovers anonymously, and is possible only because both recovery methods run over the same image in the same pass.
+Carver then reconciles the carved output against the extents recorded back in Phase 1. If a carved candidate starts inside a range that a deleted file occupied, that candidate gets renamed with the original file name and reported with the original modification time. This gives an identity to data that carving on its own recovers anonymously, and it only works because both recovery methods run over the same image in the same pass.
 
-Results are written to carved/report.txt in CSV form, including the offset and size of each candidate, the method used to determine its end, and the original name where one was recovered.
+Results go to `carved/report.txt` in CSV form, including each candidate's offset and size, the method used to find its end, and the original name wherever one was recovered.
 
-Phase 5 — Content Triage
+### Phase 5: Content triage
 
-Every file Carver encounters is examined for malicious or deceptive structure. This includes files that are still live on the file system, which are read into memory and scanned without being written out, as well as everything recovered in Phase 1 and carved in Phase 3.
+Every file Carver touches gets checked for malicious or deceptive structure. That includes files still live on the file system, which are read into memory and scanned without being written out, along with everything recovered in Phase 1 and carved in Phase 3.
 
-Four classes of finding are reported:
+It reports four classes of finding.
 
-Embedded format signatures. A second format's magic bytes appearing inside a file. This is unremarkable inside container formats — archives contain files, and Word documents contain images — but a foreign format inside a flat image file indicates a polyglot carrier. Same-format nesting, such as the JPEG thumbnail carried in a JPEG's Exif segment, is reported at informational level.
+**Embedded format signatures.** A second format's magic bytes showing up inside a file. That's normal inside container formats, since archives contain files and Word documents contain images, but a foreign format inside a flat image file points to a polyglot carrier. Same-format nesting, like the JPEG thumbnail in a JPEG's Exif segment, is reported at informational level.
 
-Appended data. For JPEG, the structural parser establishes where the file actually ends. Any data beyond that point was deliberately attached and is invisible to an image viewer. This is the standard construction for polyglot and steganographic carrier files.
+**Appended data.** For JPEG, the structural parser establishes where the file really ends. Anything past that point was attached on purpose and is invisible to an image viewer. This is the standard way polyglot and steganographic carrier files are built.
 
-Indicator strings. Executable stubs, shebangs, PDF action keywords, VBA project streams and encoded-command patterns. Severity is assigned relative to the host file: a script tag in an HTML document is expected, while the same bytes inside a JPEG are not.
+**Indicator strings.** Executable stubs, shebangs, PDF action keywords, VBA project streams and encoded-command patterns. Severity is assigned relative to the host file: a script tag in an HTML document is expected, but the same bytes inside a JPEG are not.
 
-YARA rule matches. Rules are compiled from every .yar file in the rules/ directory at startup and evaluated against each file's contents. Each rule carries its own severity and description in its metadata block, so rules can be added or replaced without modifying Carver.
+**YARA rule matches.** Rules are compiled from every `.yar` file in the `rules/` directory at startup and run against each file's contents. Each rule carries its own severity and description in its metadata block, so rules can be added or swapped out without touching Carver itself.
 
-Findings are sorted with the most severe first, which is the order in which an investigator would want to examine them, and written to threats.csv.
+Findings are sorted most severe first, which is the order an investigator would want to work through them, and written to `threats.csv`.
 
-RULES
+## Rules
 
-The bundled rule set is in the rules/ directory:
+The bundled rule set lives in the `rules/` directory:
 
-polyglot.yar — executables and archives embedded in image files, and format headers appearing away from offset zero
-scripts.yar — script content inside images, obfuscated PowerShell, webshell patterns and Windows Script Host usage
-documents.yar — Office macros, macros that execute automatically on open, remote template references, and PDF JavaScript and Launch actions
+- **polyglot.yar**: executables and archives embedded in image files, and format headers showing up somewhere other than offset zero
+- **scripts.yar**: script content inside images, obfuscated PowerShell, webshell patterns and Windows Script Host usage
+- **documents.yar**: Office macros, macros that run automatically on open, remote template references, and PDF JavaScript and Launch actions
 
-Additional rules may be placed in the same directory. A rule's severity and description metadata fields are used directly in Carver's output.
+You can drop additional rules into the same directory. A rule's severity and description metadata fields are used directly in Carver's output.
 
-OUTPUT
+## Output
+
+```
 recovered/          files recovered from surviving metadata (Phase 1)
 carved/             files carved from unallocated space (Phase 3)
 carved/report.txt   carving results with offsets, verdicts and original names
 threats.csv         content triage findings
-USAGE
-carver <image-file> [signature-config]
+```
 
-The signature configuration is optional and uses Scalpel's scalpel.conf format. Without it, Carver's built-in signature set is used.
+## Usage
+
+```
+carver <image-file> [signature-config]
+```
+
+The signature configuration is optional and uses Scalpel's `scalpel.conf` format. Without it, Carver falls back to its built-in signature set.
 
 Examples:
 
+```
 carver disk.dd
 carver disk.dd /usr/share/scalpel/scalpel.conf
-BUILDING TEST IMAGES
+```
 
-Test images containing deleted files can be constructed without root privileges or loop device access using mtools, which manipulates FAT images directly:
+## Building test images
 
+You can build test images with deleted files in them without root or loop device access by using mtools, which works on FAT images directly:
+
+```
 dd if=/dev/zero of=test.img bs=1M count=50
 mformat -i test.img -F ::
 mcopy -i test.img photo.jpg ::/vacation.jpg
 mdel -i test.img ::/vacation.jpg
+```
 
-This is useful in containerized environments where mounting is unavailable.
+This is handy in containerized environments where mounting isn't available.
 
-VERIFICATION
+## Verification
 
-Carver has been evaluated against the DFRWS 2006 File Carving Challenge, a 50MB raw image containing 32 files with no file system, published together with a complete ground-truth layout.
+Carver has been tested against the DFRWS 2006 File Carving Challenge, a 50MB raw image holding 32 files with no file system, published along with a full ground-truth layout.
 
-Six files are recovered byte-exact, matching the published sizes precisely: scenario 3a (287,186 bytes), 2d's embedded JPEG (608,703), 3b (7,113,968), 3c (178,659), 3i (24,538,540) and 4a's ZIP archive (147,150). Scenario 3i is included in the challenge specifically to defeat tools with small default size limits, and 3c is constructed with a decoy sector preceding the real image.
+Six files come out byte-exact, matching the published sizes precisely: scenario 3a (287,186 bytes), 2d's embedded JPEG (608,703), 3b (7,113,968), 3c (178,659), 3i (24,538,540) and 4a's ZIP archive (147,150). Scenario 3i is in the challenge specifically to trip up tools with small default size limits, and 3c is built with a decoy sector in front of the real image.
 
-All five fragmented JPEG scenarios — 3d, 3e, 3f, 3g and 3h — are classified FRAGMENTED, and all non-fragmented JPEG scenarios are carved exactly. The structural parser separates the two groups without error.
+All five fragmented JPEG scenarios, 3d, 3e, 3f, 3g and 3h, are classified FRAGMENTED, and every non-fragmented JPEG scenario is carved exactly. The structural parser separates the two groups without a single error.
 
-KNOWN LIMITATIONS
+## Known limitations
 
-Fragmented files are detected but not reassembled. Carver recovers the first contiguous fragment and reports the file as FRAGMENTED rather than presenting a partial file as complete. Reassembly of fragmented files remains the principal open problem in carving and was the subject of the DFRWS challenges.
+Fragmented files are detected but not reassembled. Carver recovers the first contiguous fragment and reports the file as FRAGMENTED instead of passing off a partial file as complete. Reassembling fragmented files is still the main open problem in carving and was the whole point of the DFRWS challenges.
 
-DFRWS scenario 3j places a sector beginning with a JPEG end-of-image marker immediately after the first fragment. The structural parser accepts this as a legitimate end of file and reports the fragment as complete.
+DFRWS scenario 3j puts a sector starting with a JPEG end-of-image marker right after the first fragment. The structural parser takes this as a legitimate end of file and reports the fragment as complete.
 
-On FAT file systems, deletion overwrites the first character of the file name with a marker byte. The original first character is not recoverable from the directory entry, so recovered names appear as _acation.jpg. This is a property of the file system, not of Carver.
+On FAT file systems, deletion overwrites the first character of the file name with a marker byte. The original first character can't be recovered from the directory entry, so recovered names show up as `_acation.jpg`. That's a property of the file system, not something Carver can fix.
 
-libmagic examines only the beginning of a file and therefore cannot detect incorrect carve boundaries on its own. Structural parsing is currently implemented for JPEG only; other formats rely on footer matching.
+libmagic only looks at the start of a file, so on its own it can't catch a wrong carve boundary. Structural parsing is currently implemented for JPEG only, and other formats fall back on footer matching.
 
-OLE compound documents have no footer signature and are bounded by the next header, so they are frequently reported as PARTIAL.
+OLE compound documents have no footer signature and get bounded by the next header, so they're often reported as PARTIAL.
 
-LICENSE
+## License
 
 Carver is released under the GNU General Public License, version 2. See the LICENSE file.
 
-Carver incorporates work from the following projects:
+Carver incorporates work from these projects:
 
-The Sleuth Kit (https://github.com/sleuthkit/sleuthkit) is used as a library for all file system, volume system and metadata parsing. The Sleuth Kit is distributed under a combination of the IBM Public License, the Common Public License and the GNU General Public License, depending on component.
-Scalpel (https://github.com/sleuthkit/scalpel) is the source of the signature configuration format and of the two-pass carving design with buffer overlap handling, which was adapted into carve_runs(). Scalpel is distributed under the GNU General Public License. Scalpel is itself a rewrite of Foremost and is no longer actively maintained, which is why its approach was reimplemented rather than invoked as an external program.
-libmagic, from the file project, is used for content-based type identification. It is distributed under a two-clause BSD license.
-YARA (https://github.com/VirusTotal/yara) provides the rule engine used in Phase 5. It is distributed under the BSD 3-Clause license.
+**The Sleuth Kit** (https://github.com/sleuthkit/sleuthkit) is used as a library for all file system, volume system and metadata parsing. It's distributed under a mix of the IBM Public License, the Common Public License and the GNU General Public License, depending on the component.
 
-Because Carver adapts code from Scalpel, which is licensed under the GPL, Carver as a whole is distributed under the GPL.
+**Scalpel** (https://github.com/sleuthkit/scalpel) is where the signature configuration format and the two-pass carving design with buffer overlap handling come from. That design was adapted into `carve_runs()`. Scalpel is distributed under the GPL. It's itself a rewrite of Foremost and is no longer actively maintained, which is why its approach was reimplemented here rather than called as an external program.
 
-INSTALL
+**libmagic**, from the file project, handles content-based type identification. It's distributed under a two-clause BSD license.
 
-Carver requires development packages for its four dependencies:
+**YARA** (https://github.com/VirusTotal/yara) provides the rule engine used in Phase 5. It's distributed under the BSD 3-Clause license.
 
+Because Carver adapts code from Scalpel, which is GPL-licensed, Carver as a whole is distributed under the GPL.
+
+## Install
+
+Carver needs the development packages for its four dependencies:
+
+```
 sudo apt install build-essential libtsk-dev libmagic-dev libyara-dev
 make
+```
 
-mtools is required only for building test images:
+mtools is only needed for building test images:
 
+```
 sudo apt install mtools
+```

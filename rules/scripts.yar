@@ -16,7 +16,7 @@ rule script_in_image
 
         $php     = "<?php" nocase
         $script  = "<script" nocase
-        $shebang = "#!/"
+        $shebang = "#!/bin/"
         $eval    = "eval("
 
     condition:

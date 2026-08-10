@@ -1,55 +1,8 @@
-// main.cpp
-// Carver -- disk image recovery and content triage
-// Copyright (C) 2026 Jackson Stack
-//
-// This program is free software; you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation; either version 2 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program; if not, see <https://www.gnu.org/licenses/>.
-//
-// This program adapts the signature configuration format and two-pass
-// carving design of Scalpel (https://github.com/sleuthkit/scalpel),
-// which is licensed under the GPL. It links against The Sleuth Kit,
-// libmagic and YARA; see README.md for their respective licenses.
-//
-// Disk image recovery and triage tool combining four open source projects:
-//
-//   * The Sleuth Kit (libtsk)  -- filesystem parsing, deleted file
-//                                 metadata recovery, unallocated space
-//                                 mapping.  Linked as a library.
-//   * Scalpel                  -- signature database format and the
-//                                 two-pass header/footer carving
-//                                 approach, ported into carve_runs().
-//   * libmagic (file)          -- content-based type identification.
-//   * YARA                     -- rule engine for malicious content,
-//                                 rules loaded from ./rules/*.yar
-//
-// Pipeline:
-//   Phase 1  metadata-based recovery of deleted files, recording the
-//            byte extents each one occupied
-//   Phase 2  map unallocated space, or fall back to the whole image
-//   Phase 3  signature carving over those ranges, with format-aware
-//            end-of-file detection for JPEG and ZIP
-//   Phase 4  validate carved output, and reconcile it against Phase 1
-//            extents to recover original filenames and timestamps
-//   Phase 5  content triage: scan every file -- live, recovered and
-//            carved -- for polyglot structure, embedded formats,
-//            appended data, script indicators and YARA rule matches
-//
-// Phase 5 exists because recovering a deleted file is only half the job
-// during an incident: attackers delete their tooling, so the recovered
-// set is exactly where malicious content is most likely to be.
-//
-// Build:  make
-// Run:    ./carver <image> [scalpel.conf]
+//Carver
+//recovers deleted files from a disk image and then checks them for hidden stuff
+//uses sleuthkit for the filesystem parsing, scalpel's carving approach,
+//libmagic to identify content and yara for the rules
+//runs in 5 phases, each one feeds the next
 
 #include <tsk/libtsk.h>
 #include <magic.h>
@@ -65,30 +18,26 @@
 #include <vector>
 #include <algorithm>
 
-// ===============================================================
-// Basic types
-// ===============================================================
-
+//a chunk of the disk, used for both free space runs and file extents
 struct ByteRange {
     TSK_OFF_T start;
     TSK_OFF_T length;
 };
 
+//one carving signature, same fields scalpel.conf uses
 struct Signature {
     std::string ext;
     bool case_sensitive;
     size_t max_size;
     std::vector<unsigned char> header;
-    std::vector<unsigned char> footer;   // empty == no footer
+    std::vector<unsigned char> footer;
 };
 
-// Largest file held in memory for content scanning.
+//biggest file we will hold in memory to scan, anything past this gets streamed
 static const size_t SCAN_CAP = 64u * 1024u * 1024u;
 
-// ===============================================================
-// Signature parsing / loading
-// ===============================================================
-
+//turns a scalpel style signature string into actual bytes
+//handles \xNN escapes and plain characters mixed together
 static std::vector<unsigned char> parse_sig_string(const std::string &s) {
     std::vector<unsigned char> out;
     for (size_t i = 0; i < s.size(); ) {
@@ -104,9 +53,10 @@ static std::vector<unsigned char> parse_sig_string(const std::string &s) {
     return out;
 }
 
+//built in signatures so the program works without a config file
+//jpg max is set to 50mb on purpose, the dfrws test image has a 24.5mb jpeg in it
+//to catch tools that assume a small default and truncate it
 static void load_default_signatures(std::vector<Signature> &sigs) {
-    // jpg max_size is 50MB: the DFRWS challenge includes a 24.5MB JPEG
-    // (scenario 3i) specifically to punish small default caps.
     struct { const char *ext; bool cs; size_t max; const char *hdr; const char *ftr; } defs[] = {
         { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe0", "\\xff\\xd9" },
         { "jpg", true, 50000000, "\\xff\\xd8\\xff\\xe1", "\\xff\\xd9" },
@@ -124,11 +74,15 @@ static void load_default_signatures(std::vector<Signature> &sigs) {
         sig.case_sensitive = defs[i].cs;
         sig.max_size = defs[i].max;
         sig.header = parse_sig_string(defs[i].hdr);
+        //empty footer string means this format has no footer
         if (defs[i].ftr[0] != '\0') sig.footer = parse_sig_string(defs[i].ftr);
         sigs.push_back(sig);
     }
 }
 
+//loads a real scalpel.conf if one is passed in
+//format is: extension  case_sensitive  max_size  header  [footer]
+//lines starting with # are comments and get skipped
 static bool load_conf(const char *path, std::vector<Signature> &sigs) {
     FILE *f = fopen(path, "r");
     if (f == NULL) return false;
@@ -137,6 +91,7 @@ static bool load_conf(const char *path, std::vector<Signature> &sigs) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
         char ext[64], cs[8], hdr[256], ftr[256];
         unsigned long long maxsz = 0;
+        //footer is optional so n can come back as 4 or 5
         int n = sscanf(line, "%63s %7s %llu %255s %255s", ext, cs, &maxsz, hdr, ftr);
         if (n < 4) continue;
         Signature sig;
@@ -151,6 +106,8 @@ static bool load_conf(const char *path, std::vector<Signature> &sigs) {
     return true;
 }
 
+//compares bytes against a signature pattern
+//lowercases both sides if the signature is not case sensitive
 static bool sig_match(const unsigned char *data, size_t avail,
                       const std::vector<unsigned char> &pat, bool case_sensitive) {
     if (pat.empty() || avail < pat.size()) return false;
@@ -162,36 +119,51 @@ static bool sig_match(const unsigned char *data, size_t avail,
     return true;
 }
 
-// ===============================================================
-// Format-aware end detection: JPEG
-// ===============================================================
-
+//figures out the real length of a jpeg by walking its structure
+//searching for the first ffd9 does not work because those two bytes come up
+//all the time inside the compressed image data, so you end up truncating the file
+//instead this walks marker to marker the way a decoder would
+//every marker is ff followed by a marker byte, most carry a 2 byte big endian length
+//rst markers and tem have no length so they get skipped
+//after the sos marker the entropy data runs until the next real marker, where
+//ff00 is a stuffed byte and ffd0-ffd7 are restarts, neither of which end it
+//returns 0 if the structure does not parse, which is itself useful information
+//because it usually means the file is fragmented
 static size_t jpeg_true_length(const unsigned char *d, size_t n) {
     if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return 0;
 
     size_t i = 2;
     while (i + 1 < n) {
-        if (d[i] != 0xFF) return 0;                  // lost sync
-        while (i < n && d[i] == 0xFF) i++;           // skip fill bytes
+        //if we are not sitting on a marker then we lost sync somewhere
+        if (d[i] != 0xFF) return 0;
+        //skip any fill bytes
+        while (i < n && d[i] == 0xFF) i++;
         if (i >= n) return 0;
 
         unsigned char marker = d[i];
         i++;
 
-        if (marker == 0xD9) return i;                // EOI: true end
+        //end of image, this is the real end of the file
+        if (marker == 0xD9) return i;
+        //these markers carry no length so just move on
         if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
 
         if (i + 1 >= n) return 0;
         size_t seglen = ((size_t)d[i] << 8) | (size_t)d[i+1];
+        //length includes its own 2 bytes so anything under 2 is broken
         if (seglen < 2 || i + seglen > n) return 0;
 
-        if (marker == 0xDA) {                        // start of scan
+        //start of scan, after this comes the actual compressed data
+        if (marker == 0xDA) {
             i += seglen;
             while (i + 1 < n) {
                 if (d[i] == 0xFF) {
                     unsigned char m2 = d[i+1];
-                    if (m2 == 0x00) { i += 2; continue; }               // stuffed
-                    if (m2 >= 0xD0 && m2 <= 0xD7) { i += 2; continue; } // restart
+                    //stuffed byte, not a marker
+                    if (m2 == 0x00) { i += 2; continue; }
+                    //restart marker, also not the end
+                    if (m2 >= 0xD0 && m2 <= 0xD7) { i += 2; continue; }
+                    //anything else is a real marker so stop scanning
                     break;
                 }
                 i++;
@@ -203,14 +175,13 @@ static size_t jpeg_true_length(const unsigned char *d, size_t n) {
     return 0;
 }
 
+//jpegs show up under a few different extensions
 static bool is_jpeg_ext(const std::string &e) {
     return e == "jpg" || e == "jpeg" || e == "jfif";
 }
 
-// ===============================================================
-// libmagic validation
-// ===============================================================
-
+//what libmagic should say for a correctly carved file of each type
+//if none of these show up in the description then the carve is probably garbage
 static std::vector<std::string> expected_for(const std::string &ext) {
     std::vector<std::string> v;
     if (is_jpeg_ext(ext))              { v.push_back("JPEG"); }
@@ -228,6 +199,7 @@ static std::vector<std::string> expected_for(const std::string &ext) {
     return v;
 }
 
+//case insensitive substring check, copies both strings and lowercases them
 static bool contains_ci(const std::string &hay, const std::string &needle) {
     if (needle.empty() || hay.size() < needle.size()) return false;
     std::string h = hay, n = needle;
@@ -236,6 +208,8 @@ static bool contains_ci(const std::string &hay, const std::string &needle) {
     return h.find(n) != std::string::npos;
 }
 
+//libmagic prints these when it recognizes the container but cannot read inside it
+//that means the file is cut off or has something wrong in the middle
 static bool looks_truncated(const std::string &desc) {
     static const char *warn[] = {
         "can't read", "cannot read", "truncated", "corrupt",
@@ -259,42 +233,45 @@ static const char *verdict_name(Verdict v) {
     }
 }
 
+//compares what libmagic says against what the signature claimed
 static Verdict classify(const std::string &ext, const std::string &desc) {
     std::vector<std::string> want = expected_for(ext);
+    //no rule written for this format yet
     if (want.empty()) return V_UNKNOWN;
     bool type_ok = false;
     for (size_t i = 0; i < want.size(); i++) {
         if (contains_ci(desc, want[i])) { type_ok = true; break; }
     }
+    //content is not the type we said it was, so the header matched by luck
     if (!type_ok) return V_MISMATCH;
     if (looks_truncated(desc)) return V_PARTIAL;
     return V_VALID;
 }
 
-// ===============================================================
-// PHASE 5: content triage
-// ===============================================================
-
+//one thing found inside a file during phase 5
 struct Finding {
-    std::string severity;    // INFO / SUSPICIOUS / HIGH
+    std::string severity;
     std::string label;
     long long offset;
 };
 
+//everything found in one file, plus where the file came from
 struct FileReport {
-    std::string source;      // live / recovered / carved
+    std::string source;
     std::string name;
     std::string detected;
     long long size;
     std::vector<Finding> findings;
 };
 
+//container formats are supposed to have other files inside them
 static bool type_is_container(const std::string &det) {
     return contains_ci(det, "Zip") || contains_ci(det, "Composite Document") ||
            contains_ci(det, "PDF") || contains_ci(det, "Microsoft") ||
            contains_ci(det, "tar") || contains_ci(det, "gzip");
 }
 
+//flat image formats are not, so anything foreign inside one is a problem
 static bool type_is_flat_image(const std::string &det) {
     return contains_ci(det, "JPEG") || contains_ci(det, "PNG") ||
            contains_ci(det, "GIF")  || contains_ci(det, "bitmap");
@@ -312,12 +289,12 @@ struct Indicator {
     bool binary_ok;
 };
 
-// Kept as a fallback so the tool still reports something useful when no
-// YARA rules are installed.
+//hardcoded strings worth looking for
+//kept around so the program still reports something if no yara rules are installed
 static const Indicator INDICATORS[] = {
     { "Windows PE executable stub", "This program cannot be run in DOS mode", 38, true },
     { "ELF executable header",      "\x7f" "ELF", 4, true },
-    { "Script shebang",             "#!/", 3, false },
+    { "Script shebang",             "#!/bin/", 7, false },
     { "PDF JavaScript",             "/JavaScript", 11, true },
     { "PDF OpenAction",             "/OpenAction", 11, true },
     { "PDF Launch action",          "/Launch", 7, true },
@@ -332,6 +309,7 @@ static const Indicator INDICATORS[] = {
     { "eval() call",                "eval(", 5, false },
 };
 
+//finds a pattern in a buffer and gives back where it was
 static bool mem_find(const unsigned char *d, size_t n,
                      const char *pat, size_t plen, size_t *where) {
     if (plen == 0 || n < plen) return false;
@@ -341,16 +319,14 @@ static bool mem_find(const unsigned char *d, size_t n,
     return false;
 }
 
-// ---------------------------------------------------------------
-// YARA
-// ---------------------------------------------------------------
-
+//compiled yara rules, stays loaded for the whole run
 static YR_RULES *g_yara = NULL;
 
+//lets the yara callback get at the findings list for the file being scanned
 struct YaraCtx { std::vector<Finding> *out; };
 
-// YARA 4.x callback signature. If you are on YARA 3.x the first
-// parameter (YR_SCAN_CONTEXT *) does not exist -- drop it.
+//called by yara every time a rule matches
+//this is the yara 4.x signature, on 3.x there is no scan context parameter
 static int yara_cb(YR_SCAN_CONTEXT *context, int message,
                    void *message_data, void *user_data) {
     (void)context;
@@ -359,8 +335,8 @@ static int yara_cb(YR_SCAN_CONTEXT *context, int message,
     YR_RULE *rule = (YR_RULE *)message_data;
     YaraCtx *y = (YaraCtx *)user_data;
 
-    // Rules carry their own severity and description in metadata, so
-    // adding a rule needs no code change here.
+    //rules carry their own severity and description in the meta block
+    //so adding a new rule does not mean changing anything in here
     const char *sev = "SUSPICIOUS";
     const char *desc = NULL;
     YR_META *meta;
@@ -380,6 +356,8 @@ static int yara_cb(YR_SCAN_CONTEXT *context, int message,
     return CALLBACK_CONTINUE;
 }
 
+//compiles every .yar file in the rules directory into one rule set
+//returns null if the directory is missing or nothing compiled
 static YR_RULES *load_yara_rules(const char *dir, int *rule_count) {
     *rule_count = 0;
 
@@ -391,6 +369,7 @@ static YR_RULES *load_yara_rules(const char *dir, int *rule_count) {
     if (d != NULL) {
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
+            //only take files ending in .yar
             size_t l = strlen(e->d_name);
             if (l < 5 || strcmp(e->d_name + l - 4, ".yar") != 0) continue;
 
@@ -399,6 +378,7 @@ static YR_RULES *load_yara_rules(const char *dir, int *rule_count) {
             FILE *f = fopen(path, "r");
             if (f == NULL) continue;
 
+            //add_file gives back how many errors it hit, 0 means it compiled
             int errs = yr_compiler_add_file(comp, f, NULL, path);
             fclose(f);
             if (errs == 0) files_added++;
@@ -416,13 +396,15 @@ static YR_RULES *load_yara_rules(const char *dir, int *rule_count) {
     }
     yr_compiler_destroy(comp);
 
+    //count them so we can print how many loaded
     YR_RULE *r;
     yr_rules_foreach(rules, r) { (*rule_count)++; }
     return rules;
 }
 
-// ---------------------------------------------------------------
-
+//phase 5, checks one file for anything hidden in it
+//looks for other formats embedded in it, data stuck on the end,
+//known bad strings, and whatever the yara rules catch
 static std::vector<Finding>
 scan_content(const unsigned char *d, size_t n,
              const std::string &detected,
@@ -434,7 +416,9 @@ scan_content(const unsigned char *d, size_t n,
     bool flat_img  = type_is_flat_image(detected);
     bool textual   = type_is_text(detected);
 
-    // --- (1) embedded format signatures -------------------------
+    //look for other file formats inside this one
+    //start at 1 because offset 0 is just this file's own header
+    //only report each format once so a big archive does not spam the output
     std::vector<std::string> seen;
     for (size_t i = 1; i < n; i++) {
         for (size_t s = 0; s < sigs.size(); s++) {
@@ -442,9 +426,8 @@ scan_content(const unsigned char *d, size_t n,
             if (std::find(seen.begin(), seen.end(), sigs[s].ext) != seen.end()) continue;
             seen.push_back(sigs[s].ext);
 
-            // Same format nested in itself is routine: JPEGs carry Exif
-            // thumbnails, archives contain archives. Only a foreign
-            // format inside a flat file suggests a polyglot carrier.
+            //a format inside itself is normal, jpegs carry a thumbnail jpeg in
+            //the exif data and archives hold other archives, so do not flag those
             bool same_as_host = false;
             std::vector<std::string> want = expected_for(sigs[s].ext);
             for (size_t w = 0; w < want.size(); w++) {
@@ -462,11 +445,14 @@ scan_content(const unsigned char *d, size_t n,
         }
     }
 
-    // --- (2) data appended past the structural end --------------
+    //for jpegs we already know where the file really ends
+    //so anything after that got stuck on there on purpose and an image viewer
+    //will never show it, which is how polyglots and stego carriers get built
     if (contains_ci(detected, "JPEG")) {
         size_t truelen = jpeg_true_length(d, n);
         if (truelen > 0 && truelen < n) {
             size_t extra = n - truelen;
+            //ignore a few bytes of padding
             if (extra > 16) {
                 Finding f;
                 f.severity = "HIGH";
@@ -480,7 +466,9 @@ scan_content(const unsigned char *d, size_t n,
         }
     }
 
-    // --- (3) built-in indicator strings -------------------------
+    //check the hardcoded indicator strings
+    //how bad a hit is depends on what file it turned up in, a script tag in an
+    //html file is normal but the same bytes inside a jpeg are not
     for (size_t k = 0; k < sizeof(INDICATORS)/sizeof(INDICATORS[0]); k++) {
         size_t at = 0;
         if (!mem_find(d, n, INDICATORS[k].pat, INDICATORS[k].len, &at)) continue;
@@ -494,7 +482,7 @@ scan_content(const unsigned char *d, size_t n,
         out.push_back(f);
     }
 
-    // --- (4) YARA rules -----------------------------------------
+    //run the yara rules over the same bytes if any got loaded
     if (g_yara != NULL) {
         YaraCtx yc;
         yc.out = &out;
@@ -504,26 +492,26 @@ scan_content(const unsigned char *d, size_t n,
     return out;
 }
 
+//used to sort findings worst first
 static int severity_rank(const std::string &s) {
     if (s == "HIGH") return 3;
     if (s == "SUSPICIOUS") return 2;
     return 1;
 }
 
-// ===============================================================
-// Phase 1
-// ===============================================================
-
+//a deleted file that still has metadata, plus where its data physically was
 struct DeletedFile {
     std::string name;
     TSK_OFF_T size;
     time_t mtime;
     time_t crtime;
     std::vector<ByteRange> extents;
+    //the extent callback needs these two to turn block numbers into byte offsets
     TSK_OFF_T fs_offset;
     unsigned int block_size;
 };
 
+//everything phase 1 needs to carry around while walking the directory tree
 struct Phase1Ctx {
     TSK_OFF_T fs_offset;
     unsigned int block_size;
@@ -533,10 +521,16 @@ struct Phase1Ctx {
     const std::vector<Signature> *sigs;
 };
 
+//called once per block of a file, records where that block was on the disk
+//aonly means tsk hands over addresses without reading the contents, which is
+//all we need since we are only building a map of where the file used to live
+//merges blocks that are next to each other so we get a few ranges instead of
+//thousands of individual block numbers
 static TSK_WALK_RET_ENUM
 file_extent_cb(TSK_FS_FILE *fs_file, TSK_OFF_T off, TSK_DADDR_T addr,
                char *buf, size_t len, TSK_FS_BLOCK_FLAG_ENUM flags, void *ptr) {
     DeletedFile *df = (DeletedFile *)ptr;
+    //address 0 means sparse, nothing actually stored there
     if (addr == 0 || len == 0) return TSK_WALK_CONT;
 
     TSK_OFF_T bstart = df->fs_offset + (TSK_OFF_T)addr * (TSK_OFF_T)df->block_size;
@@ -552,6 +546,7 @@ file_extent_cb(TSK_FS_FILE *fs_file, TSK_OFF_T off, TSK_DADDR_T addr,
     return TSK_WALK_CONT;
 }
 
+//formats a timestamp for printing, 0 means the filesystem never set one
 static std::string fmt_time(time_t t) {
     if (t == 0) return "-";
     char b[64];
@@ -561,14 +556,19 @@ static std::string fmt_time(time_t t) {
     return std::string(b);
 }
 
+//called once per file while walking the directory tree
+//deleted files get written out to recovered/, live files just get scanned
+//either way the contents go through phase 5
 static TSK_WALK_RET_ENUM
 dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
     Phase1Ctx *ctx = (Phase1Ctx *)ptr;
 
     if (fs_file->name == NULL) return TSK_WALK_CONT;
     const char *nm = fs_file->name->name;
+    //skip . and .. or we walk in circles
     if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) return TSK_WALK_CONT;
-    if (nm[0] == '$') return TSK_WALK_CONT;          // TSK pseudo-files
+    //tsk makes up fake files like $MBR and $FAT1, those are not real files
+    if (nm[0] == '$') return TSK_WALK_CONT;
 
     bool deleted = (fs_file->name->flags & TSK_FS_NAME_FLAG_UNALLOC) != 0;
 
@@ -577,6 +577,7 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
     else                       printf("  (metadata gone)");
     printf("\n");
 
+    //no metadata means there is nothing to read the file with
     if (fs_file->meta == NULL || fs_file->meta->size <= 0) return TSK_WALK_CONT;
 
     TSK_OFF_T size = fs_file->meta->size;
@@ -586,9 +587,9 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
     ssize_t got = tsk_fs_file_read(fs_file, 0, (char *)&data[0], readlen,
                                    TSK_FS_FILE_READ_FLAG_NONE);
     if (got <= 0) return TSK_WALK_CONT;
+    //read might come back short so shrink to what we actually got
     data.resize((size_t)got);
 
-    // Deleted files are written out; live files are scanned in memory only.
     if (deleted) {
         mkdir("recovered", 0755);
         char outpath[512];
@@ -600,6 +601,7 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
             printf("    -> recovered %zu bytes to %s\n", data.size(), outpath);
         }
 
+        //record where this file's data was so phase 4 can match carved output to it
         DeletedFile df;
         df.name = nm;
         df.size = fs_file->meta->size;
@@ -611,6 +613,7 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
 
         if (!df.extents.empty()) {
             printf("    extents:");
+            //only print the first few or the output gets unreadable
             for (size_t i = 0; i < df.extents.size() && i < 4; i++) {
                 printf(" [%lld+%lld]", (long long)df.extents[i].start,
                                        (long long)df.extents[i].length);
@@ -621,6 +624,7 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
         ctx->deleted.push_back(df);
     }
 
+    //scan the contents whether the file was deleted or not
     FileReport fr;
     fr.source = deleted ? "recovered" : "live";
     fr.name = nm;
@@ -631,11 +635,14 @@ dir_walk_cb(TSK_FS_FILE *fs_file, const char *path, void *ptr) {
         if (desc) fr.detected = desc;
     }
     fr.findings = scan_content(&data[0], data.size(), fr.detected, *ctx->sigs);
+    //only keep files that actually had something in them
     if (!fr.findings.empty()) ctx->reports->push_back(fr);
 
     return TSK_WALK_CONT;
 }
 
+//checks whether a byte offset falls inside any deleted file's old extents
+//this is what lets a carved file get its original name back
 static const DeletedFile *
 find_owner(const std::vector<DeletedFile> &dels, TSK_OFF_T off) {
     for (size_t i = 0; i < dels.size(); i++) {
@@ -648,6 +655,7 @@ find_owner(const std::vector<DeletedFile> &dels, TSK_OFF_T off) {
     return NULL;
 }
 
+//strips anything out of a filename that would cause problems on disk
 static std::string sanitize(const std::string &s) {
     std::string o;
     for (size_t i = 0; i < s.size(); i++) {
@@ -657,10 +665,7 @@ static std::string sanitize(const std::string &s) {
     return o;
 }
 
-// ===============================================================
-// Phase 2
-// ===============================================================
-
+//holds the free space runs while the block walk is building them
 struct UnallocState {
     std::vector<ByteRange> runs;
     TSK_DADDR_T prev_addr;
@@ -669,6 +674,9 @@ struct UnallocState {
     unsigned int block_size;
 };
 
+//called once per unallocated block
+//blocks come in ascending order so consecutive ones get merged into one run
+//instead of storing millions of separate block numbers
 static TSK_WALK_RET_ENUM
 block_walk_cb(const TSK_FS_BLOCK *block, void *ptr) {
     UnallocState *st = (UnallocState *)ptr;
@@ -685,13 +693,11 @@ block_walk_cb(const TSK_FS_BLOCK *block, void *ptr) {
     return TSK_WALK_CONT;
 }
 
-// ===============================================================
-// Phase 3 + 4
-// ===============================================================
-
+//one header or footer match and which signature it belongs to
 struct Hit { TSK_OFF_T offset; size_t sig_index; };
 static bool hit_less(const Hit &a, const Hit &b) { return a.offset < b.offset; }
 
+//everything we know about one carved file
 struct CarveResult {
     std::string path;
     TSK_OFF_T offset;
@@ -704,6 +710,9 @@ struct CarveResult {
     Verdict verdict;
 };
 
+//phases 3 and 4, carves files out of the free space runs then checks them
+//two passes like scalpel does it, first find all the signature positions and
+//then go back and pull the files out
 static void carve_runs(TSK_IMG_INFO *img,
                        const std::vector<ByteRange> &runs,
                        const std::vector<Signature> &sigs,
@@ -712,6 +721,9 @@ static void carve_runs(TSK_IMG_INFO *img,
                        std::vector<FileReport> *reports) {
     const size_t CHUNK = 1024 * 1024;
 
+    //the overlap has to cover the longest signature we are looking for
+    //otherwise a signature sitting across a chunk boundary gets missed and you
+    //silently lose files, which is why scalpel keeps a tail between reads
     size_t max_pat = 1;
     for (size_t i = 0; i < sigs.size(); i++) {
         if (sigs[i].header.size() > max_pat) max_pat = sigs[i].header.size();
@@ -722,6 +734,7 @@ static void carve_runs(TSK_IMG_INFO *img,
     std::vector<Hit> headers, footers;
     std::vector<unsigned char> buf(CHUNK + OVERLAP);
 
+    //first pass, find every header and footer position
     for (size_t r = 0; r < runs.size(); r++) {
         TSK_OFF_T run_start = runs[r].start;
         TSK_OFF_T run_end   = run_start + runs[r].length;
@@ -734,6 +747,9 @@ static void carve_runs(TSK_IMG_INFO *img,
             ssize_t got = tsk_img_read(img, pos, (char *)&buf[0], (size_t)want);
             if (got <= 0) break;
 
+            //only look for matches starting in the first chunk worth of bytes
+            //the overlap tail is there so a match near the end still has enough
+            //bytes after it to compare against
             size_t scan_limit = (size_t)got;
             if (scan_limit > CHUNK) scan_limit = CHUNK;
 
@@ -754,6 +770,7 @@ static void carve_runs(TSK_IMG_INFO *img,
         }
     }
 
+    //sort both so the footer search below can stop early
     std::sort(headers.begin(), headers.end(), hit_less);
     std::sort(footers.begin(), footers.end(), hit_less);
 
@@ -763,8 +780,10 @@ static void carve_runs(TSK_IMG_INFO *img,
     mkdir("carved", 0755);
     std::vector<CarveResult> results;
     int carved_count = 0, skipped = 0, reconciled = 0;
+    //once we carve a file we trust, skip any headers that fall inside it
     TSK_OFF_T skip_until = -1;
 
+    //second pass, pair headers with footers and write the files out
     for (size_t h = 0; h < headers.size(); h++) {
         const Hit &hit = headers[h];
         if (hit.offset < skip_until) { skipped++; continue; }
@@ -776,6 +795,7 @@ static void carve_runs(TSK_IMG_INFO *img,
         bool confident = false;
         bool structure_failed = false;
 
+        //first try, parse the format itself if we know how
         if (is_jpeg_ext(sig.ext)) {
             TSK_OFF_T window = (TSK_OFF_T)sig.max_size;
             if (start + window > img->size) window = img->size - start;
@@ -789,21 +809,29 @@ static void carve_runs(TSK_IMG_INFO *img,
                         method = "structure";
                         confident = true;
                     } else {
+                        //header was fine but the structure did not parse
+                        //so this file is almost certainly fragmented
                         structure_failed = true;
                     }
                 }
             }
         }
 
+        //second try, look for the footer
         if (end == -1 && !sig.footer.empty()) {
             TSK_OFF_T limit = start + (TSK_OFF_T)sig.max_size;
             for (size_t f = 0; f < footers.size(); f++) {
                 if (footers[f].offset <= start) continue;
+                //list is sorted so once we are past the window we can stop
                 if (footers[f].offset > limit) break;
                 if (footers[f].sig_index != hit.sig_index) continue;
 
                 TSK_OFF_T fo = footers[f].offset;
                 if (sig.ext == "zip") {
+                    //PK 05 06 is the start of the end of central directory record
+                    //that record is 22 bytes plus a comment, and the comment
+                    //length is in the last 2 bytes of it
+                    //without this the archive comes out 18 bytes short
                     unsigned char eocd[22];
                     if (tsk_img_read(img, fo, (char *)eocd, 22) == 22) {
                         size_t comment = (size_t)eocd[20] | ((size_t)eocd[21] << 8);
@@ -820,6 +848,9 @@ static void carve_runs(TSK_IMG_INFO *img,
             }
         }
 
+        //last resort, stop at the next header of any type
+        //formats with no footer like .doc end up here, and without this bound
+        //one of them eats the whole rest of the image
         if (end == -1) {
             TSK_OFF_T bound = start + (TSK_OFF_T)sig.max_size;
             for (size_t n = h + 1; n < headers.size(); n++) {
@@ -837,6 +868,7 @@ static void carve_runs(TSK_IMG_INFO *img,
         TSK_OFF_T len = end - start;
         if (len <= 0) continue;
 
+        //check if a deleted file used to own these bytes
         const DeletedFile *owner = find_owner(deleted, start);
 
         char outpath[512];
@@ -848,6 +880,8 @@ static void carve_runs(TSK_IMG_INFO *img,
                      carved_count, sig.ext.c_str());
         }
 
+        //keep the file in memory so we can write it and scan it without
+        //reading the same bytes off the disk twice
         size_t hold = (size_t)((len > (TSK_OFF_T)SCAN_CAP) ? (TSK_OFF_T)SCAN_CAP : len);
         std::vector<unsigned char> filedata(hold);
         ssize_t held = tsk_img_read(img, start, (char *)&filedata[0], hold);
@@ -857,6 +891,7 @@ static void carve_runs(TSK_IMG_INFO *img,
         FILE *out = fopen(outpath, "wb");
         if (out == NULL) continue;
         fwrite(&filedata[0], 1, filedata.size(), out);
+        //anything bigger than the scan cap just gets streamed straight through
         if (len > (TSK_OFF_T)filedata.size()) {
             std::vector<char> tmp(65536);
             TSK_OFF_T at = start + (TSK_OFF_T)filedata.size();
@@ -889,8 +924,11 @@ static void carve_runs(TSK_IMG_INFO *img,
             res.detected = (desc != NULL) ? desc : "(null)";
             res.verdict = classify(sig.ext, res.detected);
         }
+        //libmagic only reads the start of the file so it calls a fragmented
+        //jpeg valid, the structure parser is the one that actually knows
         if (structure_failed && res.verdict == V_VALID) res.verdict = V_FRAGMENTED;
 
+        //cut the description down or the line wraps and gets hard to read
         std::string shortdesc = res.detected;
         if (shortdesc.size() > 40) shortdesc = shortdesc.substr(0, 37) + "...";
 
@@ -904,6 +942,7 @@ static void carve_runs(TSK_IMG_INFO *img,
             reconciled++;
         }
 
+        //run phase 5 on the carved file too
         FileReport fr;
         fr.source = "carved";
         fr.name = outpath;
@@ -914,9 +953,11 @@ static void carve_runs(TSK_IMG_INFO *img,
 
         results.push_back(res);
         carved_count++;
+        //only skip ahead if we actually trust where this file ended
         if (confident) skip_until = end;
     }
 
+    //count up the verdicts for the summary
     int nv = 0, np = 0, nf = 0, nm = 0, nu = 0;
     for (size_t i = 0; i < results.size(); i++) {
         switch (results[i].verdict) {
@@ -939,11 +980,13 @@ static void carve_runs(TSK_IMG_INFO *img,
     printf("  RECONCILED        : %d   carved data matched to a deleted filename\n",
            reconciled);
 
+    //write the carving results out as csv
     FILE *rep = fopen("carved/report.txt", "w");
     if (rep) {
         fprintf(rep, "file,verdict,claimed_type,offset,size,end_detection,"
                      "original_name,original_mtime,detected_type\n");
         for (size_t i = 0; i < results.size(); i++) {
+            //libmagic descriptions have commas in them which breaks the csv
             std::string d = results[i].detected;
             for (size_t j = 0; j < d.size(); j++) if (d[j] == ',') d[j] = ';';
             fprintf(rep, "%s,%s,%s,%lld,%lld,%s,%s,%s,%s\n",
@@ -960,10 +1003,7 @@ static void carve_runs(TSK_IMG_INFO *img,
     }
 }
 
-// ===============================================================
-// Phase 5 output
-// ===============================================================
-
+//prints everything phase 5 found, worst first
 static void print_threat_report(std::vector<FileReport> &reports) {
     printf("\n=== Phase 5: content triage ===\n\n");
 
@@ -972,6 +1012,7 @@ static void print_threat_report(std::vector<FileReport> &reports) {
         return;
     }
 
+    //sort the findings inside each file
     for (size_t i = 0; i < reports.size(); i++) {
         std::sort(reports[i].findings.begin(), reports[i].findings.end(),
                   [](const Finding &a, const Finding &b) {
@@ -979,7 +1020,8 @@ static void print_threat_report(std::vector<FileReport> &reports) {
                   });
     }
 
-    // Highest-severity files first: the triage order an investigator wants.
+    //then sort the files themselves by their worst finding
+    //this puts the files worth looking at first
     std::sort(reports.begin(), reports.end(),
               [](const FileReport &a, const FileReport &b) {
                   int ra = 0, rb = 0;
@@ -1015,6 +1057,7 @@ static void print_threat_report(std::vector<FileReport> &reports) {
     printf("  SUSPICIOUS          : %d\n", susp);
     printf("  INFO                : %d\n", info);
 
+    //same csv treatment as the carving report
     FILE *tf = fopen("threats.csv", "w");
     if (tf) {
         fprintf(tf, "source,file,size,severity,finding,offset,detected_type\n");
@@ -1023,6 +1066,7 @@ static void print_threat_report(std::vector<FileReport> &reports) {
             for (size_t j = 0; j < d.size(); j++) if (d[j] == ',') d[j] = ';';
             for (size_t j = 0; j < reports[i].findings.size(); j++) {
                 const Finding &f = reports[i].findings[j];
+                //yara descriptions can have commas in them too
                 std::string lbl = f.label;
                 for (size_t k = 0; k < lbl.size(); k++) if (lbl[k] == ',') lbl[k] = ';';
                 fprintf(tf, "%s,%s,%lld,%s,%s,%lld,%s\n",
@@ -1036,8 +1080,7 @@ static void print_threat_report(std::vector<FileReport> &reports) {
     }
 }
 
-// ===============================================================
-
+//takes the image file as the first argument and an optional scalpel.conf as the second
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <image-file> [scalpel.conf]\n", argv[0]);
@@ -1045,6 +1088,7 @@ int main(int argc, char **argv) {
     }
     const char *image_path = argv[1];
 
+    //detect lets tsk work out the image format itself, sector size 0 means default
     TSK_IMG_INFO *img = tsk_img_open_sing(image_path, TSK_IMG_TYPE_DETECT, 0);
     if (img == NULL) {
         fprintf(stderr, "Failed to open image '%s': %s\n", image_path, tsk_error_get());
@@ -1055,6 +1099,7 @@ int main(int argc, char **argv) {
     printf("  Size:        %lld bytes\n", (long long)img->size);
     printf("  Sector size: %u bytes\n\n", img->sector_size);
 
+    //use the passed in config if there is one, otherwise fall back to built ins
     std::vector<Signature> sigs;
     if (argc >= 3 && load_conf(argv[2], sigs)) {
         printf("Loaded %zu signature(s) from %s\n", sigs.size(), argv[2]);
@@ -1063,12 +1108,14 @@ int main(int argc, char **argv) {
         printf("Using %zu built-in signature(s)\n", sigs.size());
     }
 
+    //libmagic is optional, if it fails we just skip validation instead of quitting
     magic_t magic = magic_open(MAGIC_NONE);
     if (magic == NULL || magic_load(magic, NULL) != 0) {
         fprintf(stderr, "Warning: libmagic unavailable, validation disabled\n");
         if (magic) { magic_close(magic); magic = NULL; }
     }
 
+    //same with yara, missing rules is not a reason to stop
     if (yr_initialize() == ERROR_SUCCESS) {
         int nrules = 0;
         g_yara = load_yara_rules("rules", &nrules);
@@ -1086,6 +1133,7 @@ int main(int argc, char **argv) {
     TSK_VS_INFO *vs = NULL;
     TSK_OFF_T fs_offset = -1;
 
+    //open the partition table and find the first real partition
     vs = tsk_vs_open(img, 0, TSK_VS_TYPE_DETECT);
     if (vs != NULL) {
         printf("Volume system: %s\n", tsk_vs_type_todesc(vs->vstype));
@@ -1093,6 +1141,7 @@ int main(int argc, char **argv) {
             printf("  Partition %d: %-24s start=%lld len=%lld %s\n",
                    (int)p->addr, p->desc, (long long)p->start, (long long)p->len,
                    (p->flags & TSK_VS_PART_FLAG_ALLOC) ? "[allocated]" : "[meta]");
+            //take the first allocated one rather than hardcoding an offset
             if (fs_offset == -1 && (p->flags & TSK_VS_PART_FLAG_ALLOC)) {
                 fs_offset = (TSK_OFF_T)p->start * vs->block_size;
             }
@@ -1116,6 +1165,7 @@ int main(int argc, char **argv) {
         ctx.magic = magic;
         ctx.sigs = &sigs;
 
+        //walk allocated and unallocated entries, recursing into directories
         TSK_FS_DIR_WALK_FLAG_ENUM wf = (TSK_FS_DIR_WALK_FLAG_ENUM)
             (TSK_FS_DIR_WALK_FLAG_ALLOC | TSK_FS_DIR_WALK_FLAG_UNALLOC |
              TSK_FS_DIR_WALK_FLAG_RECURSE);
@@ -1129,6 +1179,8 @@ int main(int argc, char **argv) {
         st.have_prev = false; st.prev_addr = 0;
         st.fs_offset = fs_offset; st.block_size = fs->block_size;
 
+        //aonly again, we only want to know where the free space is
+        //the carver reads the actual bytes later
         TSK_FS_BLOCK_WALK_FLAG_ENUM bf = (TSK_FS_BLOCK_WALK_FLAG_ENUM)
             (TSK_FS_BLOCK_WALK_FLAG_UNALLOC | TSK_FS_BLOCK_WALK_FLAG_AONLY);
         if (tsk_fs_block_walk(fs, fs->first_block, fs->last_block,
@@ -1137,6 +1189,9 @@ int main(int argc, char **argv) {
         }
         runs = st.runs;
     } else {
+        //no filesystem at all, so treat the whole image as one big free space run
+        //this is what the dfrws challenge images look like, and also what a real
+        //drive looks like after the partition table gets wiped
         printf("=== Phase 1: skipped (no filesystem) ===\n\n");
         printf("=== Phase 2: treating entire image as unallocated ===\n\n");
         ByteRange whole;
@@ -1155,6 +1210,7 @@ int main(int argc, char **argv) {
 
     print_threat_report(reports);
 
+    //clean everything up in reverse order of how it got opened
     if (g_yara) yr_rules_destroy(g_yara);
     yr_finalize();
     if (magic) magic_close(magic);
